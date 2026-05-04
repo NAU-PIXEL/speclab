@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+
+# IDE
+.idea/
+.spyproject/
+.vscode/
+
+# Data / outputs
+*.hdf
+!spectral_libraries/*.hdf
+*.pkl
+*.png
+*.csv
+!reference_data/*.csv
+!example_data/**/*.csv
+ASU_speclib/
+PIXEL_FTIR/
+sma_plots/
+debug/wards_comparison/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
