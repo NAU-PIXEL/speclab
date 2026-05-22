@@ -11,6 +11,7 @@ from .functions import (
     cal_rad,
     emcal,
     tracal,
+    refcal,
     emissivity_nem,
     emissivity_alpha,
     emissivity_hullfit,
@@ -49,6 +50,9 @@ from .utils import (
     readEmissionTXTnotes,
     readEmissionCSVnotes,
     readOMNIC,
+    loadReflectanceCSV,
+    saveReflectanceCSV,
+    loadASD,
     readDVhdf,
     saveDVhdf,
     dv_to_album,
@@ -60,4 +64,4 @@ from .utils import (
 from . import plot
 from .config import configure, get_config
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

@@ -1,13 +1,13 @@
 # speclab
 
-Python spectroscopy processing library for thermal infrared emissivity calibration
-and analysis. Ports and extends algorithms from the DaVinci spectroscopy environment.
+Python spectroscopy processing library for thermal infrared emissivity calibration,
+FTIR transmission/reflectance calibration, and VSWIR reflectance analysis.
+Ports and extends algorithms from the DaVinci spectroscopy environment.
 
 ## Features
 
-**Calibration**
-- `emcal` — full lab emission calibration pipeline (blackbody IRF, NEM / hullfit / alpha / MMD emissivity retrieval, optional noise-free IRF smoothing)
-- `tracal` — transmission calibration against a blank reference
+**Emission calibration**
+- `emcal` — full lab emission calibration pipeline (blackbody IRF, NEM / hullfit / alpha / MMD emissivity retrieval, optional noise-free IRF smoothing, water-vapour correction)
 - `dehyd` — water-vapour correction applied during or after `emcal`
 
 **Emissivity retrieval methods**
@@ -16,30 +16,49 @@ and analysis. Ports and extends algorithms from the DaVinci spectroscopy environ
 - Alpha Residuals (`alpha`) — mean-BT reference with max-emissivity rescaling
 - Maximum–Minimum Difference (`mmd`) — simple contrast-based baseline
 
+**FTIR transmission / reflectance calibration**
+- `tracal` — transmission calibration from an AutomateFTIR measurement folder; pairs each sample with its closest-in-time background and blank
+- `refcal` — reflectance calibration; same pipeline as `tracal`, reflectance semantics
+
+**VSWIR reflectance analysis**
+- `remove_continuum` — convex-hull continuum removal
+- `band_parameters` — per-feature band depth, FWHM, area, asymmetry
+- `smooth_spectrum` — Savitzky-Golay, boxcar, Gaussian smoothing
+- `detect_bands` — automatic absorption feature detection with preset matching
+
 **Spectral analysis**
 - `sma` — spectral mixture analysis (NNLS, grouped endmembers, slope endmember, cumulative overlay plots)
-- `merge` — combine emcal outputs vertically (same range, new samples) or horizontally (same samples, extended spectral range with DC-offset alignment in the overlap)
+- `merge` — combine emcal outputs vertically (same range, new samples) or horizontally (same samples, extended spectral range with DC-offset alignment)
 - `match` — merge two individual spectra covering overlapping but different spectral ranges
 
 **Data I/O**
 - `readDVhdf` / `saveDVhdf` — DaVinci-format HDF5 read/write
-- `dv_to_album` — normalise any DV HDF5 layout to the per-spectrum album dict expected by `sma` and SpectralViewer
+- `dv_to_album` — normalise any DV HDF5 layout to the per-spectrum album dict
+- `loadReflectanceCSV` / `saveReflectanceCSV` — wide-format VSWIR reflectance CSV
+- `loadASD` — ASD ViewSpecPro tab-separated text export
 - `convert_speclib` — command-line tool to convert a DV speclib HDF5 to SpectralViewer format
 
 **Instrument presets** for NAU, ASU, SwRI lab spectrometers and TES / mTES satellite instruments
 
 ## GUI tools
 
-| Command | Module | Purpose |
-|---|---|---|
-| `speclib-viewer-TIR` | `SpeclibViewerTIR` | Browse and compare spectral libraries |
-| `emission-processor` | `EmissionProcessor` | Interactive emcal / SMA results viewer |
-| *(planned)* | `EmissionAutomation` | Automated emission data collection GUI |
+| Command / Script        | Module                | Platform     | Purpose |
+|-------------------------|-----------------------|--------------|---------|
+| `speclib-viewer-LWIR`   | `SpeclibViewerLWIR`   | all          | Browse and build LWIR spectral libraries |
+| `emission-processor`    | `EmissionLWIR`        | all          | Interactive emcal / SMA results viewer |
+| `reflectance-vswir`     | `ReflectanceVSWIR`    | all          | VSWIR reflectance viewer and band analysis |
+| `AutomateFTIR.pyw`      | —                     | Windows only | Automated FTIR data collection (OMNIC DDE + Keithley 2700) |
 
 ## Installation
 
 ```bash
 pip install -e .
+```
+
+For the `AutomateFTIR` GUI on Windows, additional hardware drivers are required:
+
+```bash
+pip install pyvisa pywin32
 ```
 
 ## Quick start
@@ -60,6 +79,12 @@ sma_out = speclab.sma(out, endlib='/path/to/library.hdf')
 
 # Merge MIR and FIR emcal runs for the same samples
 broadband = speclab.merge(out_mir, out_fir, how='horizontal')
+
+# Transmission calibration from an AutomateFTIR folder
+tra_out = speclab.tracal('/path/to/tracal_data/')
+
+# Reflectance calibration
+ref_out = speclab.refcal('/path/to/refcal_data/')
 
 # Load and normalise a DV-format spectral library
 raw   = speclab.readDVhdf('/path/to/library.hdf')
@@ -93,7 +118,7 @@ Key settings at the top of `demo.py`:
 | `USE_MULTI_FOLDER` | `False` | `True` runs emcal on all four `example_data/` subfolders and merges |
 | `METHOD` | `'nem'` | Emissivity retrieval method: `'nem'`, `'hullfit'`, or `'mmd'` |
 | `ENDLIB_PATH` | `spectral_libraries/speclib_JFS_rock_forming_minerals.hdf` | Endmember library for SMA |
-| `USE_SPECLIBVIEWER` | `False` | `True` opens `SpeclibViewerTIR` to build a custom library interactively |
+| `USE_SPECLIBVIEWER` | `False` | `True` opens `SpeclibViewerLWIR` to build a custom library interactively |
 | `SHOW_PLOTS` | `True` | Display emcal and SMA result plots |
 | `SAVE_RESULTS` | `False` | Write HDF5 + CSV outputs alongside the data |
 

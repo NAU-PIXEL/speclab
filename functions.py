@@ -7,7 +7,8 @@ calibration, spectral mixture analysis, and spectral library utilities.
 Provides
 --------
 emcal                  Emission calibration (NEM / MMD / convex-hull LS fit).
-tracal                 Transmission calibration.
+tracal                 Transmission calibration (AutomateFTIR metadata CSV).
+refcal                 Reflectance calibration (AutomateFTIR metadata CSV).
 sma                    Spectral Mixture Analysis (NNLS / OLS).
 summary_sma            Pretty-print concentration summary table for SMA results.
 sort_cube              Sort endmember concentration arrays per pixel.
@@ -40,7 +41,451 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import r2_score, root_mean_squared_error
 from scipy.optimize import curve_fit, nnls, lsq_linear, minimize, minimize_scalar, NonlinearConstraint
-from scipy.signal import find_peaks
+from scipy.signal import find_peaks, savgol_filter
+from scipy.ndimage import uniform_filter1d, median_filter, gaussian_filter1d
+
+
+# =============================================================================
+# ========================== remove_continuum =================================
+# =============================================================================
+
+def _upper_hull_indices(x: np.ndarray, y: np.ndarray) -> list[int]:
+    """
+    Return the indices of the upper convex hull of the point set (x, y).
+
+    Assumes *x* is strictly monotonically increasing (as a wavelength axis is).
+    Uses Andrew's monotone chain algorithm restricted to the upper hull.
+
+    Parameters
+    ----------
+    x : np.ndarray
+        Sorted x-coordinates, shape (n,).
+    y : np.ndarray
+        Corresponding y-coordinates, shape (n,).
+
+    Returns
+    -------
+    list[int]
+        Indices into *x* / *y* that form the upper hull, ordered left to right.
+    """
+    hull: list[int] = []
+    for i in range(len(x)):
+        while len(hull) >= 2:
+            a, b = hull[-2], hull[-1]
+            # Cross product of (a→b) × (a→i); non-negative means left turn or
+            # collinear — remove b because it lies below the hull edge a→i.
+            cross = (x[b] - x[a]) * (y[i] - y[a]) - (y[b] - y[a]) * (x[i] - x[a])
+            if cross >= 0:
+                hull.pop()
+            else:
+                break
+        hull.append(i)
+    return hull
+
+
+def remove_continuum(
+    xaxis:    np.ndarray,
+    spectra:  np.ndarray,
+    wl_range: tuple[float, float] | None = None,
+) -> np.ndarray:
+    """
+    Apply convex-hull continuum removal to reflectance spectra.
+
+    For each spectrum the upper convex hull of (wavelength, reflectance) is
+    computed and interpolated to form the continuum baseline.  The returned
+    values are reflectance / continuum, confined to [0, 1], where 1 indicates
+    the spectrum lies on the continuum (no absorption) and values below 1
+    indicate absorption depth relative to the continuum.
+
+    When *wl_range* is given the hull is computed only over that sub-range;
+    channels outside the range are returned as 1.0 (on continuum).  This is
+    useful for isolating a specific absorption complex without the global
+    envelope dominating the baseline.
+
+    Parameters
+    ----------
+    xaxis : np.ndarray
+        Wavelength axis, shape (n_channels,).
+    spectra : np.ndarray
+        Reflectance spectra, shape (n_channels,) for a single spectrum or
+        (n_spectra, n_channels) for a stack.  Values should be in [0, 1].
+    wl_range : tuple[float, float] or None
+        ``(wl_lo, wl_hi)`` wavelength bounds (same units as *xaxis*) for the
+        hull computation.  Channels outside this window are set to 1.0.
+        ``None`` applies the hull to the full spectrum (default).
+
+    Returns
+    -------
+    np.ndarray
+        Continuum-removed spectra, same shape as *spectra*, dtype float64.
+    """
+    arr = np.atleast_2d(np.asarray(spectra, dtype=float))
+
+    mask = ((xaxis >= wl_range[0]) & (xaxis <= wl_range[1])
+            if wl_range is not None else np.ones(len(xaxis), dtype=bool))
+    x_sub = xaxis[mask]
+
+    result = np.ones_like(arr)   # 1.0 outside the range — on the continuum
+    if x_sub.size >= 2:
+        for i, row in enumerate(arr):
+            y_sub          = row[mask]
+            hull_idx       = _upper_hull_indices(x_sub, y_sub)
+            continuum      = np.interp(x_sub, x_sub[hull_idx], y_sub[hull_idx])
+            result[i, mask] = np.clip(y_sub / np.maximum(continuum, 1e-10), 0.0, 1.0)
+
+    return result.squeeze() if np.ndim(spectra) == 1 else result
+
+
+# =============================================================================
+# ========================== band_parameters ==================================
+# =============================================================================
+
+def band_parameters(
+    xaxis:    np.ndarray,
+    spectrum: np.ndarray,
+    wl_range: tuple[float, float],
+) -> dict[str, float] | None:
+    """
+    Compute band parameters for a single absorption feature.
+
+    Continuum removal is applied over *wl_range* using the convex-hull method
+    (see :func:`remove_continuum`).  All parameters are derived from the
+    continuum-removed (CR) reflectance within that window.
+
+    Returns ``None`` when the feature is absent or the window covers fewer
+    than three spectral channels.
+
+    Parameters
+    ----------
+    xaxis : np.ndarray
+        Wavelength axis, shape (n_channels,).  Must be monotonically increasing.
+    spectrum : np.ndarray
+        Single reflectance spectrum, shape (n_channels,).  Values in [0, 1].
+    wl_range : tuple[float, float]
+        ``(wl_lo, wl_hi)`` shoulder-to-shoulder window (same units as *xaxis*)
+        used for continuum removal.
+
+    Returns
+    -------
+    dict[str, float] or None
+        Keys: ``wl_center``, ``wl_min``, ``band_depth``, ``fwhm``,
+        ``base_width``, ``band_area``, ``band_area_ratio``,
+        ``asymmetry_hw``, ``asymmetry_centroid``.
+
+        ``wl_center``
+            Spectral centroid: absorption-weighted mean wavelength.
+        ``wl_min``
+            Wavelength of the band minimum (lowest CR reflectance point).
+        ``band_depth``
+            Fractional depth: ``1 − CR_min``, in [0, 1].
+        ``fwhm``
+            Full-width at half-maximum, interpolated to the half-depth level
+            on each side of the minimum.
+        ``base_width``
+            Band width at 10 % of the maximum depth, using the same
+            interpolation as *fwhm*.  Feature-intrinsic; independent of the
+            shoulder window.
+        ``band_area``
+            Integral of ``(1 − CR)`` over the 10 %-threshold extent, in the
+            same units as *xaxis*.
+        ``band_area_ratio``
+            ``band_area / (band_depth × base_width)``; dimensionless shape
+            metric (∼0.5 for triangular, ∼0.79 for Gaussian, →1 rectangular).
+        ``asymmetry_hw``
+            ``(wl_right_half − wl_min) / (wl_min − wl_left_half)``; ratio of
+            right to left half-widths at half maximum.  ``nan`` when the
+            left half-width is zero.
+        ``asymmetry_centroid``
+            ``(wl_center − wl_min) / fwhm``; signed centroid offset normalized
+            by FWHM.  Positive values indicate absorption weight skewed toward
+            longer wavelengths.
+    """
+    lo, hi = wl_range
+    mask   = (xaxis >= lo) & (xaxis <= hi)
+    if mask.sum() < 3:
+        return None
+
+    x_sub  = xaxis[mask]
+    cr     = remove_continuum(xaxis, spectrum, wl_range=wl_range)
+    cr_sub = cr[mask]
+
+    i_min      = int(np.argmin(cr_sub))
+    band_depth = float(1.0 - cr_sub[i_min])
+    if band_depth < 1e-4:
+        return None   # no detectable absorption
+
+    wl_min = float(x_sub[i_min])
+
+    # ── Spectral centroid ────────────────────────────────────────────────────
+    absorption = 1.0 - cr_sub
+    wl_center  = float(np.dot(x_sub, absorption) / absorption.sum())
+
+    # ── Interpolated crossing helper ─────────────────────────────────────────
+    def _left_crossing(level: float) -> float:
+        above = np.where(cr_sub[:i_min] >= level)[0]
+        if len(above) == 0:
+            return float(x_sub[0])
+        j  = int(above[-1])
+        dy = cr_sub[j + 1] - cr_sub[j]
+        t  = (level - cr_sub[j]) / dy if abs(dy) > 1e-12 else 0.0
+        return float(x_sub[j] + t * (x_sub[j + 1] - x_sub[j]))
+
+    def _right_crossing(level: float) -> float:
+        above = np.where(cr_sub[i_min + 1:] >= level)[0]
+        if len(above) == 0:
+            return float(x_sub[-1])
+        j  = int(above[0]) + i_min + 1
+        dy = cr_sub[j] - cr_sub[j - 1]
+        t  = (level - cr_sub[j - 1]) / dy if abs(dy) > 1e-12 else 0.0
+        return float(x_sub[j - 1] + t * (x_sub[j] - x_sub[j - 1]))
+
+    # ── FWHM crossings (50 % depth) ──────────────────────────────────────────
+    half      = 1.0 - band_depth / 2.0
+    wl_left   = _left_crossing(half)
+    wl_right  = _right_crossing(half)
+    fwhm      = max(wl_right - wl_left, 0.0)
+
+    # ── Base-width crossings (10 % depth) ────────────────────────────────────
+    base_level      = 1.0 - 0.10 * band_depth
+    wl_left_base    = _left_crossing(base_level)
+    wl_right_base   = _right_crossing(base_level)
+    base_width      = max(wl_right_base - wl_left_base, 0.0)
+
+    # ── Band area over 10 %-threshold extent ─────────────────────────────────
+    base_mask = (x_sub >= wl_left_base) & (x_sub <= wl_right_base)
+    x_base    = x_sub[base_mask]
+    cr_base   = cr_sub[base_mask]
+    band_area = float(np.trapz(1.0 - cr_base, x_base)) if len(x_base) >= 2 else 0.0
+
+    band_area_ratio = band_area / (band_depth * base_width) if base_width > 0 else 0.0
+
+    # ── Asymmetry: half-width ratio ──────────────────────────────────────────
+    left_hw      = wl_min - wl_left
+    right_hw     = wl_right - wl_min
+    asymmetry_hw = right_hw / left_hw if left_hw > 1e-6 else float('nan')
+
+    # ── Asymmetry: centroid offset normalized by FWHM ────────────────────────
+    asymmetry_centroid = (wl_center - wl_min) / fwhm if fwhm > 0 else 0.0
+
+    return {
+        'wl_center':          wl_center,
+        'wl_min':             wl_min,
+        'band_depth':         band_depth,
+        'fwhm':               fwhm,
+        'base_width':         base_width,
+        'band_area':          band_area,
+        'band_area_ratio':    band_area_ratio,
+        'asymmetry_hw':       asymmetry_hw,
+        'asymmetry_centroid': asymmetry_centroid,
+    }
+
+
+# =============================================================================
+# ========================= smooth_spectrum ====================================
+# =============================================================================
+
+def smooth_spectrum(
+    xaxis:    np.ndarray,
+    spectrum: np.ndarray,
+    method:   str   = 'savgol',
+    *,
+    window_nm:  float = 30.0,
+    poly_order: int   = 3,
+) -> np.ndarray:
+    """
+    Apply spectral smoothing to a single reflectance spectrum.
+
+    The smoothing scale is always expressed in nanometres and converted to
+    samples using the median channel spacing of *xaxis*, making the result
+    portable across instruments with different spectral sampling.
+
+    Parameters
+    ----------
+    xaxis : np.ndarray
+        Wavelength axis, shape (n_channels,).
+    spectrum : np.ndarray
+        Single spectrum, shape (n_channels,).
+    method : str
+        Smoothing algorithm.  One of:
+
+        ``'moving_avg'``
+            Boxcar (uniform) convolution.
+        ``'moving_median'``
+            Running median.
+        ``'savgol'``
+            Savitzky-Golay filter (default).  *window_nm* is converted to the
+            nearest odd sample count that is also > *poly_order*.
+        ``'gaussian'``
+            Gaussian kernel.  *window_nm* sets the full-width at half-maximum
+            (σ = window_nm / 2.355).
+    window_nm : float
+        Smoothing scale in nm.  For Savitzky-Golay the converted window is
+        rounded to the nearest odd sample count ≥ ``poly_order + 1``; the
+        tooltip in the GUI notes this rounding.
+    poly_order : int
+        Polynomial order for ``'savgol'``.  Ignored by other methods.
+
+    Returns
+    -------
+    np.ndarray
+        Smoothed spectrum, same shape as *spectrum*, dtype float64.
+
+    Raises
+    ------
+    ValueError
+        If *method* is not one of the four recognised strings.
+    """
+    nm_per_sample = float(np.median(np.diff(xaxis)))
+    n_samples     = max(1, round(window_nm / nm_per_sample))
+    arr           = spectrum.astype(float)
+
+    if method == 'moving_avg':
+        return uniform_filter1d(arr, size=n_samples, mode='nearest')
+
+    if method == 'moving_median':
+        return median_filter(arr, size=n_samples, mode='nearest')
+
+    if method == 'savgol':
+        win     = n_samples if n_samples % 2 == 1 else n_samples + 1
+        min_win = poly_order + 1 if (poly_order + 1) % 2 == 1 else poly_order + 2
+        win     = max(win, min_win)
+        return savgol_filter(arr, window_length=win, polyorder=poly_order,
+                             mode='nearest')
+
+    if method == 'gaussian':
+        sigma = (window_nm / 2.355) / nm_per_sample   # FWHM → σ in samples
+        return gaussian_filter1d(arr, sigma=sigma, mode='nearest')
+
+    raise ValueError(
+        f"Unknown smoothing method '{method}'. "
+        "Choose from 'moving_avg', 'moving_median', 'savgol', 'gaussian'."
+    )
+
+
+# =============================================================================
+# =========================== detect_bands ====================================
+# =============================================================================
+
+def detect_bands(
+    xaxis:    np.ndarray,
+    spectrum: np.ndarray,
+    presets:  list[dict] | None = None,
+    *,
+    smooth_method:      str   = 'savgol',
+    smooth_window_nm:   float = 30.0,
+    smooth_polyorder:   int   = 3,
+    min_prominence:     float = 0.02,
+    min_width_nm:       float = 15.0,
+    min_depth:          float = 0.01,
+    match_tolerance_nm: float = 30.0,
+) -> list[dict]:
+    """
+    Automatically detect absorption features in a reflectance spectrum.
+
+    The spectrum is smoothed, local minima are identified via prominence- and
+    width-filtered peak detection, each candidate is characterised with
+    :func:`band_parameters` on the *raw* (unsmoothed) spectrum using an
+    auto-derived shoulder window, and results are optionally matched against
+    a list of known preset features.
+
+    Parameters
+    ----------
+    xaxis : np.ndarray
+        Wavelength axis, shape (n_channels,).  Must be monotonically increasing.
+    spectrum : np.ndarray
+        Single reflectance spectrum, shape (n_channels,).  Values in [0, 1].
+    presets : list[dict] or None
+        Preset feature list (keys: ``name``, ``wavelength``, ``fwhm``,
+        ``wl_range``).  Loaded from the YAML by the viewer.  ``None`` skips
+        matching.
+    smooth_method : str
+        Passed to :func:`smooth_spectrum`.
+    smooth_window_nm : float
+        Smoothing scale in nm, passed to :func:`smooth_spectrum`.
+    smooth_polyorder : int
+        Savitzky-Golay polynomial order, passed to :func:`smooth_spectrum`.
+    min_prominence : float
+        Minimum peak prominence in reflectance units [0–1] for
+        ``scipy.signal.find_peaks``.  Controls sensitivity to shallow features
+        relative to their local background.
+    min_width_nm : float
+        Minimum peak width in nm, converted to samples for ``find_peaks``.
+    min_depth : float
+        Minimum ``band_depth`` (from :func:`band_parameters`, after continuum
+        removal) to retain a candidate.
+    match_tolerance_nm : float
+        A detected ``wl_min`` is matched to a preset when the distance to its
+        nominal ``wavelength`` is within this tolerance.  The closest preset
+        within tolerance is selected.
+
+    Returns
+    -------
+    list[dict]
+        Candidates sorted by ``wl_min``.  Each entry contains all keys from
+        :func:`band_parameters` plus:
+
+        ``wl_range``
+            ``(wl_lo, wl_hi)`` shoulder window used for continuum removal.
+        ``matched_name``
+            Name of the closest preset within tolerance, or ``None``.
+        ``matched_preset``
+            The full preset dict, or ``None``.
+    """
+    smoothed = smooth_spectrum(
+        xaxis, spectrum, smooth_method,
+        window_nm=smooth_window_nm, poly_order=smooth_polyorder,
+    )
+
+    nm_per_sample     = float(np.median(np.diff(xaxis)))
+    min_width_samples = max(1, round(min_width_nm / nm_per_sample))
+
+    # ── Detect minima in smoothed spectrum ───────────────────────────────────
+    min_indices, _ = find_peaks(
+        -smoothed,
+        prominence=min_prominence,
+        width=min_width_samples,
+    )
+    if len(min_indices) == 0:
+        return []
+
+    # ── Shoulder candidates: local maxima in smoothed + endpoints ────────────
+    max_indices, _ = find_peaks(smoothed)
+    shoulders = np.concatenate([[0], max_indices, [len(xaxis) - 1]])
+
+    candidates: list[dict] = []
+    for i_peak in min_indices:
+        left_sh  = shoulders[shoulders < i_peak]
+        right_sh = shoulders[shoulders > i_peak]
+        i_left   = int(left_sh[-1])  if len(left_sh)  > 0 else 0
+        i_right  = int(right_sh[0])  if len(right_sh) > 0 else len(xaxis) - 1
+
+        wl_range = (float(xaxis[i_left]), float(xaxis[i_right]))
+
+        bp = band_parameters(xaxis, spectrum, wl_range)
+        if bp is None or bp['band_depth'] < min_depth:
+            continue
+
+        # ── Preset matching: closest within tolerance ─────────────────────
+        matched_name:   str  | None = None
+        matched_preset: dict | None = None
+        if presets:
+            best_dist = match_tolerance_nm
+            for preset in presets:
+                dist = abs(bp['wl_min'] - float(preset['wavelength']))
+                if dist < best_dist:
+                    best_dist      = dist
+                    matched_name   = preset['name']
+                    matched_preset = preset
+
+        candidates.append({
+            **bp,
+            'wl_range':       wl_range,
+            'matched_name':   matched_name,
+            'matched_preset': matched_preset,
+        })
+
+    candidates.sort(key=lambda c: c['wl_min'])
+    return candidates
 
 
 # =============================================================================
@@ -258,12 +703,13 @@ def load_sbm(
         note_flist = []
 
     previous_results = utils.findFiles(['emcal', 'results'], ext, fdir)
-    bbc_flist = utils.findFiles(_BB_WARM_PATTERNS, ext, fdir)
-    bbh_flist = utils.findFiles(_BB_HOT_PATTERNS,  ext, fdir)
+    bbc_flist        = utils.findFiles(_BB_WARM_PATTERNS,    ext, fdir)
+    bbh_flist        = utils.findFiles(_BB_HOT_PATTERNS,     ext, fdir)
+    log_flist        = utils.findFiles(['live-log'],          ext, fdir)
 
     flist = utils.findFiles("", ext, fdir)
     flist = [f for f in flist
-             if f not in bbc_flist + bbh_flist + note_flist + previous_results]
+             if f not in bbc_flist + bbh_flist + note_flist + previous_results + log_flist]
     flist.sort()
 
     if not flist:
@@ -414,12 +860,44 @@ def cal_rad(
             )
 
     # Resolve BB temperatures
-    # When the notes file is missing and at least one BB temp is needed, call
-    # on_missing_bb_temps once to collect both (dialog or terminal), then use
-    # each result only where the explicit arg is absent.
+    # Call on_missing_bb_temps once when (a) the notes file is absent, or
+    # (b) the notes are present but BB resistance columns are NaN/empty (e.g.
+    # the multimeter was not connected during BB collection).  The callback
+    # must return (bb1_K, bb2_K); raise MissingTempsError inside it to abort.
+    _bbc_pat = '|'.join(_BB_WARM_PATTERNS)
+    _bbh_pat = '|'.join(_BB_HOT_PATTERNS)
     _cb_bb1_k: float | None = None
     _cb_bb2_k: float | None = None
-    if not _notes_loaded and lab == "nau" and (bb1 is None or bb2 is None):
+
+    _need_bb_callback = False
+    if lab == "nau" and (bb1 is None or bb2 is None):
+        if not _notes_loaded:
+            _need_bb_callback = True
+        else:
+            # Notes loaded — check whether resistance columns are usable.
+            if bb1 is None:
+                _bbc_q = notes[notes["sample_name"].str.contains(
+                    _bbc_pat, case=False, regex=True)]
+                if not _bbc_q.empty:
+                    _r1 = _bbc_q["channel_101"].values[0]
+                    _r2 = _bbc_q["channel_102"].values[0]
+                    if pd.isna(_r1) or pd.isna(_r2):
+                        _need_bb_callback = True
+            if not _need_bb_callback and bb2 is None:
+                _bbh_q = notes[notes["sample_name"].str.contains(
+                    _bbh_pat, case=False, regex=True)]
+                if not _bbh_q.empty:
+                    _r1 = _bbh_q["channel_101"].values[0]
+                    _r2 = _bbh_q["channel_102"].values[0]
+                    if pd.isna(_r1) or pd.isna(_r2):
+                        _need_bb_callback = True
+            if _need_bb_callback:
+                logging.warning(
+                    "BB resistance values are NaN in measurement info "
+                    "(multimeter not connected during BB collection?). "
+                    "Requesting temperatures via on_missing_bb_temps.")
+
+    if _need_bb_callback:
         if on_missing_bb_temps is not None:
             _cb_bb1_k, _cb_bb2_k = on_missing_bb_temps()
         else:
@@ -428,11 +906,9 @@ def cal_rad(
             if bb2 is None:
                 _cb_bb2_k = _prompt_bb_temp("hot BB")
 
-    _bbc_pat = '|'.join(_BB_WARM_PATTERNS)
-    _bbh_pat = '|'.join(_BB_HOT_PATTERNS)
-
     if bb1 is None and lab == "nau":
-        if _notes_loaded:
+        # Use callback result when notes were absent or had NaN resistances.
+        if _notes_loaded and _cb_bb1_k is None:
             bbc_row = notes[notes["sample_name"].str.contains(_bbc_pat, case=False, regex=True)]
             bbc_res_ch1 = bbc_row["channel_101"].values[0]
             bbc_res_ch2 = bbc_row["channel_102"].values[0]
@@ -451,7 +927,8 @@ def cal_rad(
             bbc_temp = utils.r2t_nau(bbc_res_ch1, bbc_res_ch2)
 
     if bb2 is None and lab == "nau":
-        if _notes_loaded:
+        # Use callback result when notes were absent or had NaN resistances.
+        if _notes_loaded and _cb_bb2_k is None:
             bbh_row = notes[notes["sample_name"].str.contains(_bbh_pat, case=False, regex=True)]
             bbh_res_ch1 = bbh_row["channel_101"].values[0]
             bbh_res_ch2 = bbh_row["channel_102"].values[0]
@@ -666,6 +1143,7 @@ def emcal(
     noise_free: bool = True,
     downwelling_temps: dict[str, float] | None = None,
     on_missing_bb_temps: Callable[[], tuple[float, float]] | None = None,
+    ow: bool = False,
 ) -> dict:
     """
     Perform emission calibration on a folder of FTIR spectra.
@@ -942,176 +1420,14 @@ def emcal(
     # Save results
     if save:
         logging.info("Saving results ...")
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        fname_hdf = fdir + f"/emcal_results_{timestamp}.hdf"
-        fname_csv = fdir + f"/emcal_results_{timestamp}.csv"
+        timestamp = '' if ow else datetime.now().strftime("%Y%m%d_%H%M%S")
+        sep       = '_' if timestamp else ''
+        fname_hdf = fdir + f"/emcal_results{sep}{timestamp}.hdf"
+        fname_csv = fdir + f"/emcal_results{sep}{timestamp}.csv"
         utils.saveDVhdf(out, fname_hdf)
         logging.info("Saved HDF to %s", fname_hdf)
         utils.save_emcal_csv(out, fname_csv)
         logging.info("Saved CSV to %s", fname_csv)
-
-    return out
-
-
-# =============================================================================
-# ============================= tracal ========================================
-# =============================================================================
-def tracal(
-    fdir: str,
-    plot: bool = False,
-    save: bool = True,
-    ext: str = ".csv",
-    use_blank: bool = True,
-    ow: bool = False,
-) -> dict:
-    """
-    Perform transmission calibration on a folder of FTIR spectra.
-
-    Locates a background and (optionally) a blank spectrum, then computes
-    sample transmittances relative to the blank.  Results can be plotted and
-    saved as both an HDF5 and an Excel file.
-
-    Parameters
-    ----------
-    fdir : str
-        Path to folder containing spectra.
-    plot : bool
-        If True, display a two-panel transmittance summary plot.
-    save : bool
-        If True, write results to ``tracal_results_<timestamp>.pkl`` and
-        ``.xlsx`` inside *fdir*.
-    ext : str
-        File extension to search for (e.g. ``".csv"``).
-    use_blank : bool
-        If True, divide by the blank spectrum; if False, divide by the
-        background directly.
-    ow : bool
-        If True, omit the timestamp from saved filenames (overwrite mode).
-
-    Returns
-    -------
-    dict
-        Result dict with keys ``header``, ``wn``, ``wl``, ``sbm``, ``tra``.
-        ``tra`` contains per-sample transmittance arrays plus ``mean`` and
-        ``std``.
-    """
-    # Load the background
-    search_terms = ["control", "background", "bkg"]
-    bkg_flist = utils.findFiles(search_terms, ext, fdir)
-    if len(bkg_flist) == 0:
-        raise IOError("Could not find a matching background file in folder %s\nExpected naming convention should be %s with %s extensions" % (fdir, search_terms, ext))
-    elif len(bkg_flist) > 1:
-        raise IOError("Found multiple potential background files: %s" % bkg_flist)
-    else:
-        logging.info("Found background spectrum: %s", bkg_flist[0])
-        # bkg = pd.read_csv(bkg_flist[0], header=None, names=["wn", "data"])
-        bkg = utils.readOMNIC(bkg_flist[0])
-
-    # Extract xaxis
-    wn = bkg["wn"]
-
-    # Load the Blank
-    search_terms = ["blank", "empty", "0%"]
-    blank_flist = utils.findFiles(search_terms, ext, fdir)
-
-    if use_blank:
-        if len(blank_flist) == 0:
-            logging.warning(
-                "No blank spectrum found in %s — falling back to background directly.",
-                fdir,
-            )
-            blank = bkg
-            use_blank = False
-        elif len(blank_flist) > 1:
-            raise IOError("Found multiple potential background files: %s" % blank_flist)
-        else:
-            logging.info("Found blank spectrum: %s", blank_flist[0])
-            blank = utils.readOMNIC(blank_flist[0])
-    else:
-        if len(blank_flist) > 0:
-            logging.info("Ignoring blank spectrum at user's request; using background directly.")
-        blank = bkg
-
-
-    # Load the samples
-    flist = utils.findFiles("", ext, fdir)
-    flist = [f for f in flist if f not in blank_flist + bkg_flist]
-    flist.sort()
-    samples = []
-    labels = []
-    for fname in flist:
-        spec = utils.readOMNIC(fname)
-        samples.append(spec)
-        if hasattr(spec, 'name'):
-            labels.append(spec.name)
-        else:
-            labels.append(fname.split("/")[-1][:-4])
-
-    n = len(samples)
-    logging.info("Found %i samples in folder", n)
-
-
-    # Compute blank transmission
-    blank_T = blank["data"] / bkg["data"]
-
-    # Extract transmission data from samples
-    data = np.vstack([el["data"] / blank["data"] for el in samples])
-    meanT = np.nanmean(data, axis=0)
-    stdT = np.nanstd(data, axis=0)
-
-
-    # Build output dictionary
-    out = {}                # Header
-    out["header"] = {"Processed": datetime.now(),
-                     "bkg file": bkg_flist[0],
-                     "blank file": blank_flist[0],
-                     "use_blank": use_blank,
-                     "sample labels": labels}
-
-    out["wn"] = wn
-    out["wl"] = 1e4 / wn
-    out["sbm"] = {}         # Raw data
-    out["sbm"]["wn"] = wn
-    out["sbm"]["bkg"] = bkg["data"]
-    out["sbm"]["blank"] = blank["data"]
-    for i in range(n):
-        out["sbm"][labels[i]] = samples[i]["data"]
-
-    out["tra"] = {}         # Calculated transmission
-    out["tra"]["wn"] = wn
-    out["tra"]["blank"] = blank_T
-    for i in range(n):
-        out["tra"][labels[i]] = data[i, :]
-    out["tra"]["mean"] = meanT
-    out["tra"]["std"] = stdT
-
-
-    # Plot results
-    if plot:
-        plot_tracal(out)
-
-    # Save output as json and/or csv
-    if save:
-        logging.info("Saving results ...")
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-        if ow:
-            timestamp = ""
-
-        # First an HDF5 file
-        fname = fdir + f"/tracal_results_{timestamp}.hdf"
-        utils.saveDVhdf(out, fname)
-
-        # Next an Excel spredasheet
-        fname = fdir + f"/tracal_results_{timestamp}.xlsx"
-        writer = pd.ExcelWriter(fname, engine="xlsxwriter")
-        for key in out.keys():
-            df = pd.DataFrame(out[key])
-            if key == "header":
-                df.T.to_excel(writer, sheet_name=key)
-            else:
-                df.to_excel(writer, sheet_name=key)
-        writer.close()
 
     return out
 
@@ -5025,4 +5341,344 @@ def merge(
         logging.info("merge: saved merged dict to '%s'", save_path)
 
     return result
+
+
+# =============================================================================
+# =========================== tracal / refcal =================================
+# =============================================================================
+
+_RATIO_MIN_DENOM_FRACTION = 1e-3
+"""Pixels where |denom| < this fraction of max(|denom|) are set to NaN."""
+
+
+def _safe_divide(num: np.ndarray, denom: np.ndarray) -> np.ndarray:
+    """
+    Element-wise division with a near-zero denominator guard.
+
+    Any pixel where ``|denom|`` is below ``_RATIO_MIN_DENOM_FRACTION`` of the
+    denominator's own peak absolute value is replaced with NaN rather than
+    producing ±Inf.  The numerator is not thresholded.
+
+    Parameters
+    ----------
+    num, denom : np.ndarray
+        Arrays of the same shape.
+
+    Returns
+    -------
+    np.ndarray
+        ``num / denom`` with near-zero denominator pixels set to ``np.nan``.
+    """
+    peak = np.nanmax(np.abs(denom))
+    if peak == 0.0:
+        return np.full_like(num, np.nan, dtype=float)
+    threshold = peak * _RATIO_MIN_DENOM_FRACTION
+    safe_denom = np.where(np.abs(denom) >= threshold, denom, np.nan)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        return num / safe_denom
+
+
+def _ratio_cal_impl(
+    fdir: str,
+    ext: str,
+    notes_path: 'str | None',
+    plot: bool,
+    save: bool,
+    ow: bool,
+    mode: str,
+) -> dict:
+    """
+    Shared implementation for :func:`tracal` and :func:`refcal`.
+
+    Parameters
+    ----------
+    mode : str
+        ``'transmittance'`` or ``'reflectance'``.  Controls output key names,
+        saved file prefix, and whether absorbance / optical depth are computed.
+    """
+    if '~' in fdir:
+        fdir = os.path.expanduser(fdir)
+    fdir = os.path.abspath(fdir)
+
+    # ── 1. Load measurement-info CSV ─────────────────────────────────────────
+    df, flist = _load_notes(notes_path if notes_path is not None else fdir)
+    if df is None:
+        raise IOError(
+            "No measurement-info file found in %s. "
+            "Collect spectra with AutomateFTIR first." % fdir
+        )
+
+    required_cols = {'sample_name', 'is_bkg', 'is_blank', 'is_bb', 'dtime'}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(
+            "Measurement-info file is missing columns: %s. "
+            "Is this an AutomateFTIR notes file?" % sorted(missing)
+        )
+
+    df = df.copy()
+    df['_dtime'] = pd.to_datetime(df['dtime'], format='mixed', errors='coerce')
+
+    # ── 2. Partition rows by spectrum type ────────────────────────────────────
+    is_bkg_col   = df['is_bkg'].astype(int)
+    is_blank_col = df['is_blank'].astype(int)
+    is_bb_col    = df['is_bb'].astype(int)
+
+    bkg_rows    = df[is_bkg_col   == 1]
+    blank_rows  = df[is_blank_col == 1]
+    sample_rows = df[(is_bb_col == 0) & (is_bkg_col == 0) & (is_blank_col == 0)]
+
+    if bkg_rows.empty:
+        raise IOError("No background spectra (is_bkg=1) in measurement-info file.")
+    if sample_rows.empty:
+        raise IOError("No sample spectra in measurement-info file.")
+
+    has_blank = not blank_rows.empty
+
+    # ── 3. File loader ────────────────────────────────────────────────────────
+    ext_upper = ext.upper()
+    ext_lower = ext.lower()
+
+    def _load_spectrum(sample_name: str) -> dict:
+        for suffix in (ext_upper, ext_lower):
+            fpath = os.path.join(fdir, sample_name + suffix)
+            if os.path.exists(fpath):
+                return utils.readOMNIC(fpath)
+        raise IOError(
+            "Spectrum file not found for '%s' (tried %s, %s) in %s"
+            % (sample_name, ext_upper, ext_lower, fdir)
+        )
+
+    # ── 4. Load reference spectra (bkg and blank) ─────────────────────────────
+    # Cache as {name: (spec_dict, timestamp)} — first occurrence wins.
+    bkg_cache: dict = {}
+    blank_cache: dict = {}
+
+    for _, row in bkg_rows.iterrows():
+        name = row['sample_name']
+        if name not in bkg_cache:
+            try:
+                bkg_cache[name] = (_load_spectrum(name), row['_dtime'])
+            except IOError as exc:
+                logging.warning("Skipping bkg '%s': %s", name, exc)
+
+    if has_blank:
+        for _, row in blank_rows.iterrows():
+            name = row['sample_name']
+            if name not in blank_cache:
+                try:
+                    blank_cache[name] = (_load_spectrum(name), row['_dtime'])
+                except IOError as exc:
+                    logging.warning("Skipping blank '%s': %s", name, exc)
+        if not blank_cache:
+            logging.warning(
+                "All blank files failed to load — falling back to bkg directly."
+            )
+            has_blank = False
+
+    if not bkg_cache:
+        raise IOError("All background files failed to load from %s." % fdir)
+
+    # ── 5. Closest-in-time helper ─────────────────────────────────────────────
+    def _closest(cache: dict, t_sample: 'pd.Timestamp') -> dict:
+        """Return the spectrum dict whose timestamp is closest to *t_sample*."""
+        best = min(
+            cache.items(),
+            key=lambda kv: abs((kv[1][1] - t_sample).total_seconds()),
+        )
+        return best[1][0]   # (name, (spec, t)) → spec
+
+    # Wavenumber axis from first background
+    wn = next(iter(bkg_cache.values()))[0]['wn']
+
+    # ── 6. Compute ratios per sample ──────────────────────────────────────────
+    labels     = []
+    ratio_arr  = []
+    sbm_out    = {}
+
+    for _, row in sample_rows.iterrows():
+        name = row['sample_name']
+        try:
+            spec = _load_spectrum(name)
+        except IOError as exc:
+            logging.warning("Skipping sample '%s': %s", name, exc)
+            continue
+
+        t_sample = row['_dtime']
+        bkg      = _closest(bkg_cache, t_sample)
+
+        if has_blank:
+            blank = _closest(blank_cache, t_sample)
+            # (sample/bkg) / (blank/bkg)  =  sample / blank
+            ratio = _safe_divide(spec['data'], blank['data'])
+        else:
+            ratio = _safe_divide(spec['data'], bkg['data'])
+
+        labels.append(name)
+        ratio_arr.append(ratio)
+        sbm_out[name] = spec['data']
+
+    if not labels:
+        raise IOError("No sample spectra could be loaded from %s." % fdir)
+
+    ratio_matrix = np.vstack(ratio_arr)
+    ratio_key    = 'tra' if mode == 'transmittance' else 'ref'
+
+    # ── 7. Build output dict ──────────────────────────────────────────────────
+    out: dict = {}
+    out['header'] = {
+        'Processed':     datetime.now().isoformat(),
+        'mode':          mode,
+        'bkg_names':     list(bkg_cache.keys()),
+        'blank_names':   list(blank_cache.keys()),
+        'use_blank':     has_blank,
+        'sample_labels': labels,
+        'notes_file':    flist[0] if flist else '',
+    }
+    out['wn'] = wn
+    out['wl'] = 1e4 / wn
+
+    out['sbm'] = {'wn': wn}
+    for bkg_name, (bkg_spec, _) in bkg_cache.items():
+        out['sbm'][f'bkg:{bkg_name}'] = bkg_spec['data']
+    if has_blank:
+        for bl_name, (bl_spec, _) in blank_cache.items():
+            out['sbm'][f'blank:{bl_name}'] = bl_spec['data']
+    out['sbm'].update(sbm_out)
+
+    out[ratio_key] = {'wn': wn}
+    for i, name in enumerate(labels):
+        out[ratio_key][name] = ratio_matrix[i]
+    out[ratio_key]['mean'] = np.nanmean(ratio_matrix, axis=0)
+    out[ratio_key]['std']  = np.nanstd(ratio_matrix,  axis=0)
+
+    if mode == 'transmittance':
+        with np.errstate(invalid='ignore', divide='ignore'):
+            abs_matrix = -np.log10(ratio_matrix)
+            od_matrix  = -np.log(ratio_matrix)
+
+        out['abs'] = {'wn': wn}
+        for i, name in enumerate(labels):
+            out['abs'][name] = abs_matrix[i]
+        out['abs']['mean'] = np.nanmean(abs_matrix, axis=0)
+        out['abs']['std']  = np.nanstd(abs_matrix,  axis=0)
+
+        out['od'] = {'wn': wn}
+        for i, name in enumerate(labels):
+            out['od'][name] = od_matrix[i]
+        out['od']['mean'] = np.nanmean(od_matrix, axis=0)
+        out['od']['std']  = np.nanstd(od_matrix,  axis=0)
+
+    # ── 8. Save results ───────────────────────────────────────────────────────
+    if save:
+        prefix    = 'tracal'   if mode == 'transmittance' else 'refcal'
+        timestamp = '' if ow else datetime.now().strftime('%Y%m%d_%H%M%S')
+        sep       = '_' if timestamp else ''
+
+        hdf_path = os.path.join(fdir, f'{prefix}_results{sep}{timestamp}.hdf')
+        utils.saveDVhdf(out, hdf_path)
+        logging.info("%s HDF saved: %s", mode, hdf_path)
+
+        csv_path = os.path.join(fdir, f'{prefix}_results{sep}{timestamp}.csv')
+        if mode == 'transmittance':
+            utils.save_tracal_csv(out, csv_path)
+        else:
+            utils.save_refcal_csv(out, csv_path)
+        logging.info("%s CSV saved: %s", mode, csv_path)
+
+    return out
+
+
+def tracal(
+    fdir: str,
+    ext: str = '.csv',
+    notes_path: 'str | None' = None,
+    plot: bool = False,
+    save: bool = False,
+    ow: bool = False,
+) -> dict:
+    """
+    Perform transmission calibration on an AutomateFTIR measurement folder.
+
+    Uses the ``*-measurement-info.csv`` metadata file to identify background
+    (``is_bkg=1``), blank (``is_blank=1``), and sample spectra, then pairs
+    each sample with its **closest-in-time** background and blank.
+
+    Formulae
+    --------
+    Without blank:  ``T = sample / bkg``
+    With blank:     ``T = (sample / bkg) / (blank / bkg) = sample / blank``
+    Absorbance:     ``A = −log₁₀(T)``
+    Optical depth:  ``OD = −ln(T)``
+
+    Parameters
+    ----------
+    fdir : str
+        Path to the measurement folder.  ``~`` is expanded.
+    ext : str
+        Spectral file extension (default ``'.csv'``).
+    notes_path : str or None
+        Explicit path to the measurement-info CSV.  Auto-located if ``None``.
+    plot : bool
+        Not yet implemented (reserved for a future summary plot).
+    save : bool
+        If True, write results to ``tracal_results_<timestamp>.hdf`` and
+        ``.csv`` inside *fdir*.
+    ow : bool
+        If True, omit the timestamp from saved filenames (overwrite mode).
+
+    Returns
+    -------
+    dict
+        Keys: ``header``, ``wn``, ``wl``, ``sbm``, ``tra``, ``abs``, ``od``.
+        Each of ``tra``, ``abs``, ``od`` contains per-sample arrays plus
+        ``mean`` and ``std``.
+    """
+    return _ratio_cal_impl(
+        fdir, ext=ext, notes_path=notes_path,
+        plot=plot, save=save, ow=ow, mode='transmittance',
+    )
+
+
+def refcal(
+    fdir: str,
+    ext: str = '.csv',
+    notes_path: 'str | None' = None,
+    plot: bool = False,
+    save: bool = False,
+    ow: bool = False,
+) -> dict:
+    """
+    Perform reflectance calibration on an AutomateFTIR measurement folder.
+
+    Identical logic to :func:`tracal` but uses ``'reflectance'`` semantics:
+    output key is ``'ref'`` instead of ``'tra'``; absorbance and optical depth
+    are not computed.
+
+    Parameters
+    ----------
+    fdir : str
+        Path to the measurement folder.  ``~`` is expanded.
+    ext : str
+        Spectral file extension (default ``'.csv'``).
+    notes_path : str or None
+        Explicit path to the measurement-info CSV.  Auto-located if ``None``.
+    plot : bool
+        Not yet implemented (reserved for a future summary plot).
+    save : bool
+        If True, write results to ``refcal_results_<timestamp>.hdf`` and
+        ``.csv`` inside *fdir*.
+    ow : bool
+        If True, omit the timestamp from saved filenames (overwrite mode).
+
+    Returns
+    -------
+    dict
+        Keys: ``header``, ``wn``, ``wl``, ``sbm``, ``ref``.
+        ``ref`` contains per-sample arrays plus ``mean`` and ``std``.
+    """
+    return _ratio_cal_impl(
+        fdir, ext=ext, notes_path=notes_path,
+        plot=plot, save=save, ow=ow, mode='reflectance',
+    )
 

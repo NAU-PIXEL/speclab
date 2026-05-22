@@ -76,10 +76,26 @@ def _add_top_axis(ax: plt.Axes, which: str = "wl") -> plt.Axes | None:
         secax.set_xlabel('Wavenumber (cm\u207b\xb9)')
     elif which == "wl":
         # Primary is cm⁻¹ → top shows µm
-        secax.xaxis.set_ticks(
-            [2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 20, 25, 50])
+        wl_lo, wl_hi = sorted([1e4 / lo, 1e4 / hi])
+        visible = [t for t in _WL_TICKS_UM if wl_lo <= t <= wl_hi]
+        if len(visible) > _WL_TICKS_MAX:
+            step = (len(visible) + _WL_TICKS_MAX - 1) // _WL_TICKS_MAX
+            visible = visible[::step]
+        if visible:
+            secax.xaxis.set_ticks(visible)
         secax.set_xlabel('Wavelength (\u03bcm)')
     return secax
+
+
+# Candidate wavelength tick positions (µm) spanning VNIR → FIR.
+_WL_TICKS_UM: list = [
+    0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0,   # VNIR
+    1.25, 1.5, 2.0, 2.5,                  # SWIR
+    3, 5, 7, 10, 12, 15, 20,              # MWIR / TIR  (strategic, not every integer)
+    25, 30, 50, 75, 100, 150, 200,        # FIR
+]
+# Maximum ticks to show before thinning kicks in.
+_WL_TICKS_MAX = 12
 
 
 # =============================================================================

@@ -684,10 +684,30 @@ def readEmissionCSVnotes(
             raise IOError(
                 "No info file (.csv/.xls/.xlsx) found in folder %s" % fpath
             )
-        elif len(flist) > 1:
-            raise IOError(
-                "Found multiple info files in folder %s: %s" % (fpath, flist)
-            )
+        if len(flist) > 1:
+            # Nextcloud (and other sync clients) may create conflict copies
+            # alongside the original, e.g. "foo (conflicted copy ...).csv".
+            # Strip those out before deciding whether the result is ambiguous.
+            clean = [f for f in flist
+                     if 'conflicted' not in os.path.basename(f).lower()
+                     and 'conflict'  not in os.path.basename(f).lower()]
+            if len(clean) == 1:
+                logging.warning(
+                    "Ignoring %d conflict copy/copies alongside '%s'",
+                    len(flist) - 1, clean[0],
+                )
+                flist = clean
+            elif len(clean) == 0:
+                # All copies are conflict files — take the most recently modified.
+                flist = [max(flist, key=os.path.getmtime)]
+                logging.warning(
+                    "All info files appear to be conflict copies; "
+                    "using most recently modified: %s", flist[0],
+                )
+            else:
+                raise IOError(
+                    "Found multiple info files in folder %s: %s" % (fpath, clean)
+                )
         fname = flist[0]
     elif os.path.isfile(fpath):
         fname = fpath
@@ -1408,6 +1428,135 @@ def readOMNIC(fname: str) -> dict:
 
 
 # =============================================================================
+# ========================= Reflectance file I/O ==============================
+# =============================================================================
+
+# Column names accepted as the wavelength axis (checked case-insensitively).
+_WL_COLUMN_NAMES: frozenset[str] = frozenset({'wavelength', 'wl', 'wav', 'lambda', 'nm'})
+
+
+def loadReflectanceCSV(path: 'str | Path') -> pd.DataFrame:
+    """
+    Parse a generic wide-format reflectance CSV into a DataFrame.
+
+    The file must contain exactly one wavelength column, identified
+    case-insensitively from :data:`_WL_COLUMN_NAMES`.  All remaining columns
+    are treated as individual reflectance spectra.
+
+    Parameters
+    ----------
+    path : str or Path
+        Path to the CSV file.
+
+    Returns
+    -------
+    pd.DataFrame
+        Wide-format DataFrame: wavelength column followed by one column per
+        spectrum, with original column names preserved.
+
+    Raises
+    ------
+    ValueError
+        If no wavelength column is found or no spectrum columns are present.
+    """
+    from pathlib import Path as _Path
+    path = _Path(path)
+    df = pd.read_csv(path)
+
+    wl_cols = [c for c in df.columns if c.strip().lower() in _WL_COLUMN_NAMES]
+    if not wl_cols:
+        raise ValueError(
+            f"No wavelength column found in '{path.name}'.\n"
+            f"Expected a column named one of: {', '.join(sorted(_WL_COLUMN_NAMES))}."
+        )
+    if not any(c != wl_cols[0] for c in df.columns):
+        raise ValueError(
+            f"'{path.name}' contains only the wavelength column; no spectrum data found."
+        )
+    return df
+
+
+def saveReflectanceCSV(
+    path:    'str | Path',
+    xaxis:   'np.ndarray',
+    spectra: 'dict[str, np.ndarray]',
+) -> None:
+    """
+    Write a wide-format reflectance CSV readable by :func:`loadReflectanceCSV`.
+
+    Parameters
+    ----------
+    path : str or Path
+        Destination file path.  Any existing file is overwritten.
+    xaxis : np.ndarray
+        Wavelength axis, shape ``(n_channels,)``.
+    spectra : dict[str, np.ndarray]
+        Mapping of spectrum name → 1-D reflectance array, each shape
+        ``(n_channels,)``.  Column order follows dict insertion order.
+
+    Raises
+    ------
+    ValueError
+        If *spectra* is empty or any spectrum length does not match *xaxis*.
+    """
+    from pathlib import Path as _Path
+    import numpy as _np
+    path = _Path(path)
+
+    if not spectra:
+        raise ValueError("'spectra' is empty — nothing to write.")
+    for name, data in spectra.items():
+        if len(data) != len(xaxis):
+            raise ValueError(
+                f"Spectrum '{name}' has {len(data)} samples but xaxis has "
+                f"{len(xaxis)} — lengths must match."
+            )
+
+    pd.DataFrame({'Wavelength': xaxis, **spectra}).to_csv(path, index=False)
+
+
+def loadASD(path: 'str | Path') -> pd.DataFrame:
+    """
+    Parse an ASD spectrometer tab-separated text export into a DataFrame.
+
+    The ASD ViewSpecPro export produces a wide-format table: first column is
+    the wavelength axis (nm, integer), remaining columns are named after the
+    original ``.asd`` acquisition filenames.
+
+    Parameters
+    ----------
+    path : str or Path
+        Path to the ASD ``.txt`` export file.
+
+    Returns
+    -------
+    pd.DataFrame
+        Wide-format DataFrame: wavelength column followed by one column per
+        spectrum, with original ASD filenames as column headers.
+
+    Raises
+    ------
+    ValueError
+        If no wavelength column is found or no spectrum columns are present.
+    """
+    from pathlib import Path as _Path
+    path = _Path(path)
+    df = pd.read_csv(path, sep='\t')
+
+    wl_cols = [c for c in df.columns if c.strip().lower() in _WL_COLUMN_NAMES]
+    if not wl_cols:
+        raise ValueError(
+            f"No wavelength column found in '{path.name}'.\n"
+            f"Expected first column named one of: {', '.join(sorted(_WL_COLUMN_NAMES))}."
+        )
+    if not any(c != wl_cols[0] for c in df.columns):
+        raise ValueError(
+            f"'{path.name}' contains only the wavelength column; no spectrum data found."
+        )
+    return df
+
+
+# =============================================================================
 # Spectral library format conversion
 # =============================================================================
 
@@ -1597,3 +1746,69 @@ def dv_to_album(raw: dict) -> dict:
         "dv_to_album: unrecognised HDF5 layout — "
         f"top-level keys: {list(raw.keys())[:8]}"
     )
+
+
+def save_tracal_csv(out: dict, fname: str) -> None:
+    """
+    Save transmittance, absorbance, and optical depth spectra from a
+    :func:`~functions.tracal` output dict to a single CSV file.
+
+    One row per wavenumber point.  The index column is ``wavenumber_cm-1``.
+    Columns are grouped by quantity, each sample suffixed with ``_tra``,
+    ``_abs``, or ``_od``.  The mean and standard deviation across samples are
+    appended as ``mean_tra`` / ``std_tra``, etc.
+
+    Parameters
+    ----------
+    out : dict
+        Output dict from :func:`~functions.tracal`.
+        Required keys: ``wn``, ``tra``.  Optional: ``abs``, ``od``.
+    fname : str
+        Output file path (e.g. ``"tracal_results.csv"``).
+    """
+    wn     = np.asarray(out['wn'])
+    labels = out['header']['sample_labels']
+    cols   = {}
+
+    for key, suffix in (('tra', '_tra'), ('abs', '_abs'), ('od', '_od')):
+        if key not in out:
+            continue
+        block = out[key]
+        for lbl in labels:
+            cols[lbl + suffix] = block[lbl]
+        cols['mean' + suffix] = block['mean']
+        cols['std'  + suffix] = block['std']
+
+    df = pd.DataFrame(cols, index=wn)
+    df.index.name = 'wavenumber_cm-1'
+    df.to_csv(fname)
+
+
+def save_refcal_csv(out: dict, fname: str) -> None:
+    """
+    Save reflectance spectra from a :func:`~functions.refcal` output dict
+    to a single CSV file.
+
+    One row per wavenumber point.  The index column is ``wavenumber_cm-1``.
+    Per-sample columns are suffixed with ``_ref``; the cross-sample mean and
+    standard deviation are written as ``mean_ref`` and ``std_ref``.
+
+    Parameters
+    ----------
+    out : dict
+        Output dict from :func:`~functions.refcal`.
+        Required keys: ``wn``, ``ref``.
+    fname : str
+        Output file path (e.g. ``"refcal_results.csv"``).
+    """
+    wn     = np.asarray(out['wn'])
+    labels = out['header']['sample_labels']
+    block  = out['ref']
+
+    cols = {lbl + '_ref': block[lbl] for lbl in labels}
+    cols['mean_ref'] = block['mean']
+    cols['std_ref']  = block['std']
+
+    df = pd.DataFrame(cols, index=wn)
+    df.index.name = 'wavenumber_cm-1'
+    df.to_csv(fname)

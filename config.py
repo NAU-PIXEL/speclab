@@ -14,9 +14,14 @@ Usage
 
 import json
 import logging
+import os
+import platform
 from pathlib import Path
 
-_CONFIG_FILE = Path.home() / '.config' / 'speclab' / 'config.json'
+if platform.system() == 'Windows':
+    _CONFIG_FILE = Path(os.environ.get('APPDATA', Path.home())) / 'speclab' / 'config.json'
+else:
+    _CONFIG_FILE = Path.home() / '.config' / 'speclab' / 'config.json'
 
 _CONFIG: dict = {}
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "speclab"
-version = "0.1.0"
+version = "0.2.0"
 description = "Spectroscopy processing library for emissivity calibration and analysis"
 requires-python = ">=3.10"
 dependencies = [
@@ -14,15 +14,22 @@ dependencies = [
     "matplotlib",
     "h5py",
     "scikit-learn",
+    "cmcrameri",
+    "pyyaml",
 ]
+
+[project.optional-dependencies]
+windows = ["pyvisa", "pywin32"]
 
 [tool.setuptools.packages.find]
 where = [".."]
 include = ["speclab*"]
 
 [project.scripts]
-speclib-viewer-TIR = "speclab.SpeclibViewerTIR:launch"
-emission-processor = "speclab.EmissionProcessor:launch"
+speclib-viewer      = "speclab.SpeclibViewer:launch"
+speclib-viewer-LWIR = "speclab.SpeclibViewerLWIR:launch"
+emission-processor  = "speclab.EmissionLWIR:launch"
+reflectance-vswir   = "speclab.ReflectanceVSWIR:launch"
 
 [tool.setuptools.package-data]
-speclab = ["reference_data/*"]
+speclab = ["reference_data/*", "reference_data/**/*"]

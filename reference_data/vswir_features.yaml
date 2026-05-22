@@ -1,0 +1,95 @@
+# VSWIR spectral absorption features
+# Used by ReflectanceVSWIR as preset feature markers and band-parameter targets.
+# Fields:
+#   name      (str)              display label
+#   group     (str)              grouping for the UI
+#   wavelength (nm, float)       nominal band centre
+#   fwhm      (nm, float)        display FWHM for the shaded band
+#   wl_range  ([lo, hi], nm)     shoulder-to-shoulder window for CR and band params
+
+features:
+
+  # ── Vegetation ──────────────────────────────────────────────────────────
+  - name: Carotenoid
+    group: Vegetation
+    wavelength: 450
+    fwhm: 30
+    wl_range: [400, 560]
+  - name: Chlorophyll Red
+    group: Vegetation
+    wavelength: 680
+    fwhm: 30
+    wl_range: [620, 760]
+
+  # ── Iron ────────────────────────────────────────────────────────────────
+  - name: "Fe³⁺ Charge Transfer"
+    group: Iron
+    wavelength: 530
+    fwhm: 50
+    wl_range: [460, 650]
+  - name: "Fe³⁺ Goethite"
+    group: Iron
+    wavelength: 900
+    fwhm: 80
+    wl_range: [800, 1050]
+  - name: "Fe²⁺ Pyroxene / Olivine"
+    group: Iron
+    wavelength: 1000
+    fwhm: 150
+    wl_range: [850, 1250]
+
+  # ── Water ───────────────────────────────────────────────────────────────
+  - name: Water Overtone
+    group: Water
+    wavelength: 970
+    fwhm: 35
+    wl_range: [900, 1060]
+  - name: Water Combination
+    group: Water
+    wavelength: 1200
+    fwhm: 45
+    wl_range: [1100, 1330]
+  - name: "Water (1400 nm)"
+    group: Water
+    wavelength: 1400
+    fwhm: 60
+    wl_range: [1330, 1500]
+  - name: "Water / CO₂ (1900 nm)"
+    group: Water
+    wavelength: 1900
+    fwhm: 70
+    wl_range: [1800, 2020]
+
+  # ── Sulfate ─────────────────────────────────────────────────────────────
+  - name: Gypsum S-OH
+    group: Sulfate
+    wavelength: 1750
+    fwhm: 30
+    wl_range: [1680, 1830]
+
+  # ── Hydroxyl / Clay ─────────────────────────────────────────────────────
+  - name: Kaolinite / Alunite
+    group: "Hydroxyl / Clay"
+    wavelength: 2160
+    fwhm: 25
+    wl_range: [2090, 2225]
+  - name: Al-OH / Carbonate
+    group: "Hydroxyl / Clay"
+    wavelength: 2200
+    fwhm: 50
+    wl_range: [2120, 2285]
+  - name: Fe-OH (Nontronite)
+    group: "Hydroxyl / Clay"
+    wavelength: 2285
+    fwhm: 30
+    wl_range: [2235, 2345]
+  - name: Mg-OH (Serpentine / Chlorite)
+    group: "Hydroxyl / Clay"
+    wavelength: 2320
+    fwhm: 30
+    wl_range: [2275, 2395]
+  - name: Carbonate / C-H
+    group: "Hydroxyl / Clay"
+    wavelength: 2340
+    fwhm: 40
+    wl_range: [2285, 2430]
