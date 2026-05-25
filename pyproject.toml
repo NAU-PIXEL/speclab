@@ -27,7 +27,6 @@ include = ["speclab*"]
 
 [project.scripts]
 speclib-viewer      = "speclab.SpeclibViewer:launch"
-speclib-viewer-LWIR = "speclab.SpeclibViewerLWIR:launch"
 emission-processor  = "speclab.EmissionLWIR:launch"
 reflectance-vswir   = "speclab.ReflectanceVSWIR:launch"
 

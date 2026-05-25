@@ -4,7 +4,7 @@ speclab demo — emcal → SMA → plot
 
 Steps
 -----
-0. (Optional) Build a custom endmember library interactively with SpeclibViewerLWIR,
+0. (Optional) Build a custom endmember library interactively with SpeclibViewer,
    then export it.  Set USE_SPECLIBVIEWER = True below to activate this step.
 
 1. Emission calibration (emcal).
@@ -28,7 +28,7 @@ import numpy as np
 import speclab
 from speclab import emcal, sma, summary_sma, merge
 from speclab import readDVhdf, printStructInfo, saveDVhdf, save_emcal_csv
-from speclab.SpeclibViewerLWIR import SpeclibViewerLWIR
+from speclab.SpeclibViewer import SpeclibViewer
 
 # =============================================================================
 # USER CONFIGURATION
@@ -69,7 +69,7 @@ N_BB = 2
 WN_RANGE_EMCAL = (400.0, 1600.0)
 
 # --- Endmember library -------------------------------------------------------
-# Set USE_SPECLIBVIEWER = True to launch SpeclibViewerLWIR and build a custom library.
+# Set USE_SPECLIBVIEWER = True to launch SpeclibViewer and build a custom library.
 # Set USE_SPECLIBVIEWER = False and supply ENDLIB_PATH to use an existing file.
 USE_SPECLIBVIEWER = False
 
@@ -153,12 +153,12 @@ else:
 # printStructInfo(emcal_out)
 
 # =============================================================================
-# STEP 2 (optional) — Build endmember library with SpeclibViewerLWIR
+# STEP 2 (optional) — Build endmember library with SpeclibViewer
 # =============================================================================
 
 if USE_SPECLIBVIEWER:
-    print("\nLaunching SpeclibViewerLWIR — build your album and use 'Export Album' to save.")
-    app = SpeclibViewerLWIR()
+    print("\nLaunching SpeclibViewer — build your album and use 'Export Album' to save.")
+    app = SpeclibViewer()
     app.wait_window()
 
     exported = filedialog.askopenfilename(

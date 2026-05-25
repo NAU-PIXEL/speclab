@@ -36,7 +36,7 @@ Ports and extends algorithms from the DaVinci spectroscopy environment.
 - `dv_to_album` — normalise any DV HDF5 layout to the per-spectrum album dict
 - `loadReflectanceCSV` / `saveReflectanceCSV` — wide-format VSWIR reflectance CSV
 - `loadASD` — ASD ViewSpecPro tab-separated text export
-- `convert_speclib` — command-line tool to convert a DV speclib HDF5 to SpectralViewer format
+- `convert_speclib` — command-line tool to convert spectral libraries: DV HDF5 → SpectralViewer format, USGS splib07 → speclab HDF5, CRISM spectral library → speclab HDF5
 
 **Instrument presets** for NAU, ASU, SwRI lab spectrometers and TES / mTES satellite instruments
 
@@ -44,7 +44,7 @@ Ports and extends algorithms from the DaVinci spectroscopy environment.
 
 | Command / Script        | Module                | Platform     | Purpose |
 |-------------------------|-----------------------|--------------|---------|
-| `speclib-viewer-LWIR`   | `SpeclibViewerLWIR`   | all          | Browse and build LWIR spectral libraries |
+| `speclib-viewer`        | `SpeclibViewer`       | all          | Browse and build spectral libraries (LWIR / VSWIR) |
 | `emission-processor`    | `EmissionLWIR`        | all          | Interactive emcal / SMA results viewer |
 | `reflectance-vswir`     | `ReflectanceVSWIR`    | all          | VSWIR reflectance viewer and band analysis |
 | `AutomateFTIR.pyw`      | —                     | Windows only | Automated FTIR data collection (OMNIC DDE + Keithley 2700) |
@@ -91,6 +91,20 @@ raw   = speclab.readDVhdf('/path/to/library.hdf')
 album = speclab.dv_to_album(raw)
 ```
 
+### VSWIR reflectance
+
+```python
+from speclab import remove_continuum, band_parameters, smooth_spectrum
+
+# wl: wavelength axis in nm, refl: reflectance array (0–1)
+refl_sm = smooth_spectrum(wl, refl, method='savgol', window_nm=20, polyorder=3)
+cr      = remove_continuum(wl, refl_sm, wl_range=(400, 2500))
+
+# Band depth, centre, FWHM for the 2200 nm Al-OH feature
+bp = band_parameters(wl, cr, wl_range=(2150, 2250))
+print(bp['depth'], bp['center'], bp['fwhm'])
+```
+
 ## Instrument presets
 
 ```python
@@ -118,13 +132,15 @@ Key settings at the top of `demo.py`:
 | `USE_MULTI_FOLDER` | `False` | `True` runs emcal on all four `example_data/` subfolders and merges |
 | `METHOD` | `'nem'` | Emissivity retrieval method: `'nem'`, `'hullfit'`, or `'mmd'` |
 | `ENDLIB_PATH` | `spectral_libraries/speclib_JFS_rock_forming_minerals.hdf` | Endmember library for SMA |
-| `USE_SPECLIBVIEWER` | `False` | `True` opens `SpeclibViewerLWIR` to build a custom library interactively |
+| `USE_SPECLIBVIEWER` | `False` | `True` opens `SpeclibViewer` to build a custom library interactively |
 | `SHOW_PLOTS` | `True` | Display emcal and SMA result plots |
 | `SAVE_RESULTS` | `False` | Write HDF5 + CSV outputs alongside the data |
 
 ### Example data
 
-`example_data/` contains four Ward's rock standard sets measured at NAU:
+`example_data/` contains:
+
+**LWIR emission (Ward's rock standards, NAU)**
 
 | Subfolder | Rock types |
 |---|---|
@@ -136,9 +152,39 @@ Key settings at the top of `demo.py`:
 Each subfolder contains sample CSVs, `bbhot.CSV`, `bbwarm.CSV`, and a
 `measurement-info.csv` notes file with timestamps and instrument channel data.
 
-## Convert a DV spectral library to SpectralViewer format
+**VSWIR reflectance**
 
+| Path | Contents |
+|---|---|
+| `ASD_data/Orochi_analyses_2.csv` | ASD field reflectance spectra (Orochi site) |
+| `dummy_vswir/` | Synthetic VSWIR dataset for testing |
+
+## Bundled spectral libraries
+
+| File | Spectral range | Contents |
+|---|---|---|
+| `speclib_JFS_rock_forming_minerals.hdf` | LWIR | NAU rock-forming mineral endmember library |
+| `ASU_speclib_full_SV.hdf` | LWIR | ASU thermal emission spectral library |
+| `CSE_wards_rock_library_SV.hdf` | LWIR | CSE Ward's rock standards |
+| `usgs_splib07_cvASD.hdf` | VSWIR | USGS Spectral Library 7 — ASD-convolved variant |
+| `crism_speclib.hdf` | VSWIR | CRISM spectral library |
+
+## Spectral library conversion
+
+### DV HDF5 → SpectralViewer format
 ```bash
 python -m speclab.convert_speclib convert input.hdf output.hdf
 python -m speclab.convert_speclib test    input.hdf
+```
+
+### USGS splib07 → speclab HDF5
+```bash
+python -m speclab.convert_speclib usgs splib07_dir/ output.hdf
+# Restrict to specific chapters and library variant:
+python -m speclab.convert_speclib usgs splib07_dir/ output.hdf --source cvASD --chapters Minerals Vegetation
+```
+
+### CRISM spectral library → speclab HDF5
+```bash
+python -m speclab.convert_speclib crism input.hdf output.hdf
 ```

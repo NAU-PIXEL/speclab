@@ -110,7 +110,7 @@ def _load_hdf(path: str) -> dict:
 
     Delegates I/O to :func:`utils.readDVhdf` and handles two on-disk layouts:
 
-    * **Per-spectrum** (``saveDVhdf`` / SpeclibViewerLWIR export) — one sub-group
+    * **Per-spectrum** (``saveDVhdf`` / SpeclibViewer export) — one sub-group
       per spectrum at the top level.  String integer keys are cast to ``int``
       spec-IDs.
     * **Grouped** (``makeASUspeclib_dev`` / DaVinci native) — a shared
