@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 SpeclibViewer — GUI browser and album builder for TIR and VNIR spectral libraries.
-
+/Users/jfsmekens/Downloads/CRISM_Speclib.hdf
 Supports two spectral modes, detected automatically from the loaded library:
   TIR  — thermal infrared (wavenumber cm⁻¹), emissivity axis, TES/ASTER/THEMIS
           resampling, atmospheric opacity overlay.
@@ -240,6 +240,7 @@ _FILTER_FIELD_DISPLAY: dict[str, str] = {
     'collection_locality':'Locality',
     # VNIR / CRISM library fields
     'type':               'Instr. Type',
+    'spectral_range':     'Spectral Range',
     'body':               'Body',
     'material':           'Material',
     'mineral_family':     'Min. Family',

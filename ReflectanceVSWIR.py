@@ -25,14 +25,11 @@ from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
-from scipy.stats import gaussian_kde
 
 import matplotlib
 matplotlib.use('TkAgg')
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-from matplotlib.lines import Line2D
 import matplotlib.pyplot as plt
 import matplotlib.transforms as mtransforms
 
@@ -46,9 +43,10 @@ if __package__ is None:
     __package__ = 'speclab'
 
 from . import __version__
+from .plot import plot_band_parameters
 from .functions import remove_continuum, band_parameters, smooth_spectrum, detect_bands
 from .utils import (
-    loadASD, loadReflectanceCSV, saveReflectanceCSV, readDVhdf, _WL_COLUMN_NAMES,
+    load_reflectance_vswir, saveReflectanceCSV, readDVhdf,
 )
 from .SpeclibViewer import SpeclibViewer
 
@@ -98,6 +96,7 @@ _LIB_FIELD_DISPLAY: dict[str, str] = {
     'collection_locality':  'Locality',
     # CRISM spectral library fields
     'type':                 'Instrument',
+    'spectral_range':       'Spectral Range',
     'body':                 'Body',
     'material':             'Material',
     'mineral_family':       'Min. Family',
@@ -146,40 +145,6 @@ for _cmc_name in ['batlowS', 'hawaiiS', 'lipariS', 'tokyoS']:
     _cols = _cmc_colors(_cmc_name)
     if _cols is not None:
         _COLOR_SCHEMES[_cmc_name] = _cols
-
-
-# ---------------------------------------------------------------------------
-# CSV I/O
-# ---------------------------------------------------------------------------
-
-def _df_to_xaxis_spectra(
-    df: pd.DataFrame,
-    path: Path,
-) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-    """Extract ``(xaxis, spectra_dict)`` from a wide-format reflectance DataFrame."""
-    wl_col = next(c for c in df.columns if c.strip().lower() in _WL_COLUMN_NAMES)
-    xaxis  = df[wl_col].to_numpy(dtype=np.float64)
-    spectra: dict[str, np.ndarray] = {}
-    for col in df.columns:
-        if col == wl_col:
-            continue
-        try:
-            spectra[col] = df[col].to_numpy(dtype=np.float64)
-        except (ValueError, TypeError) as exc:
-            raise ValueError(
-                f"Column '{col}' in '{path.name}' contains non-numeric data."
-            ) from exc
-    return xaxis, spectra
-
-
-def _read_vswir_csv(path: Path) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-    """Read a generic VSWIR reflectance CSV → ``(xaxis, spectra_dict)``."""
-    return _df_to_xaxis_spectra(loadReflectanceCSV(path), path)
-
-
-def _read_vswir_asd(path: Path) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-    """Read an ASD tab-separated text export → ``(xaxis, spectra_dict)``."""
-    return _df_to_xaxis_spectra(loadASD(path), path)
 
 
 # ---------------------------------------------------------------------------
@@ -606,6 +571,7 @@ class BandIdentificationDialog(tk.Toplevel):
         n_data_available: int = 0,
         n_lib_plotted:    int = 0,
         n_lib_available:  int = 0,
+        all_data_range:   tuple[float, float] | None = None,
     ) -> None:
         super().__init__(master)
         self.title('Identify Bands')
@@ -613,11 +579,12 @@ class BandIdentificationDialog(tk.Toplevel):
         self.grab_set()
         self.transient(master)
 
-        self.cancelled:      bool     = True
-        self.selected_names: set[str] = set()
-        self.params:         dict     = {}
-        self.data_scope:     str      = 'plotted'
-        self.lib_scope:      str      = 'plotted'
+        self.cancelled:      bool                    = True
+        self.selected_names: set[str]                = set()
+        self.params:         dict                    = {}
+        self.data_scope:     str                     = 'plotted'
+        self.lib_scope:      str                     = 'plotted'
+        self.wl_range:       tuple[float, float]     = (350.0, 2500.0)
 
         self._all_items = all_items
         self._sel_vars: list[tk.BooleanVar] = [
@@ -638,6 +605,17 @@ class BandIdentificationDialog(tk.Toplevel):
         self._width_var      = tk.DoubleVar(value=15.0)
         self._depth_var      = tk.DoubleVar(value=0.010)
         self._tolerance_var  = tk.DoubleVar(value=30.0)
+        self._wl_lo_var      = tk.DoubleVar(value=350.0)
+        self._wl_hi_var      = tk.DoubleVar(value=2500.0)
+
+        # Pre-compute ranges for quick-set buttons
+        if all_items:
+            xmins = [float(e['xaxis'].min()) for e in all_items]
+            xmaxs = [float(e['xaxis'].max()) for e in all_items]
+            self._plotted_range: tuple[float, float] | None = (min(xmins), max(xmaxs))
+        else:
+            self._plotted_range = None
+        self._all_data_range = all_data_range
 
         self._build()
         self.wait_window(self)
@@ -737,6 +715,42 @@ class BandIdentificationDialog(tk.Toplevel):
                     from_=1.0, to=200.0, increment=5.0,
                     width=8, format='%.1f').pack(side=tk.LEFT, padx=(4, 0))
 
+        # ── Spectral range ────────────────────────────────────────────────────
+        sr_lf = ttk.LabelFrame(frm, text='Spectral Range', padding=(6, 4))
+        sr_lf.pack(fill=tk.X, pady=(0, 8))
+
+        rng_row = ttk.Frame(sr_lf)
+        rng_row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(rng_row, text='Range (nm):', anchor='w').pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Spinbox(rng_row, textvariable=self._wl_lo_var,
+                    from_=100.0, to=50000.0, increment=50.0,
+                    width=8, format='%.0f').pack(side=tk.LEFT)
+        ttk.Label(rng_row, text='–').pack(side=tk.LEFT, padx=6)
+        ttk.Spinbox(rng_row, textvariable=self._wl_hi_var,
+                    from_=100.0, to=50000.0, increment=50.0,
+                    width=8, format='%.0f').pack(side=tk.LEFT)
+        ttk.Label(rng_row, text='nm').pack(side=tk.LEFT, padx=(4, 0))
+
+        def _set_range(lo: float, hi: float) -> None:
+            self._wl_lo_var.set(lo)
+            self._wl_hi_var.set(hi)
+
+        qs_row = ttk.Frame(sr_lf)
+        qs_row.pack(fill=tk.X)
+        ttk.Button(qs_row, text='VSWIR (350–2500)',
+                   command=lambda: _set_range(350.0, 2500.0),
+                   ).pack(side=tk.LEFT, padx=(0, 4))
+        if self._all_data_range is not None:
+            lo, hi = self._all_data_range
+            ttk.Button(qs_row, text=f'All data ({lo:.0f}–{hi:.0f} nm)',
+                       command=lambda lo=lo, hi=hi: _set_range(lo, hi),
+                       ).pack(side=tk.LEFT, padx=(0, 4))
+        if self._plotted_range is not None:
+            lo, hi = self._plotted_range
+            ttk.Button(qs_row, text=f'Plotted ({lo:.0f}–{hi:.0f} nm)',
+                       command=lambda lo=lo, hi=hi: _set_range(lo, hi),
+                       ).pack(side=tk.LEFT)
+
         # ── Scope ─────────────────────────────────────────────────────────────
         scope_lf = ttk.LabelFrame(frm, text='Scope', padding=(6, 4))
         scope_lf.pack(fill=tk.X, pady=(0, 10))
@@ -798,6 +812,7 @@ class BandIdentificationDialog(tk.Toplevel):
             'min_depth':          self._depth_var.get(),
             'match_tolerance_nm': self._tolerance_var.get(),
         }
+        self.wl_range   = (self._wl_lo_var.get(), self._wl_hi_var.get())
         self.data_scope = self._data_scope_var.get()
         self.lib_scope  = self._lib_scope_var.get()
         self.cancelled  = False
@@ -938,54 +953,29 @@ _BAND_METRIC_SPEC: list[tuple[str, str, bool, str]] = [
 
 
 # Clean single-line display labels for metrics (used in dropdowns and axis labels).
-# Keys match _BAND_METRIC_SPEC; '{unit}' is replaced at runtime.
-_METRIC_CLEAN_LABELS: dict[str, str] = {
-    'wl_center':          'Band center ({unit})',
-    'wl_min':             'Band min ({unit})',
-    'band_depth':         'Depth',
-    'fwhm':               'FWHM ({unit})',
-    'base_width':         'Base width ({unit})',
-    'band_area':          'Band area ({unit})',
-    'band_area_ratio':    'Area ratio',
-    'asymmetry_hw':       'Asymmetry (HW)',
-    'asymmetry_centroid': 'Asymmetry (centroid)',
-}
-
 
 class BandVizWindow(tk.Toplevel):
     """
     Non-modal visualization window for band parameter results.
 
-    Two tabs:
-
-    **Scatter** — two modes selectable via radio buttons:
-
-    * *Metric vs Metric* — each point is a (spectrum × band) pair, X and Y
-      are independently chosen metrics.  Points are coloured by band name,
-      feature group, or left uniform.
-    * *Band vs Band* — each point is one spectrum; X is one band's value for
-      the chosen metric, Y is another band's value.  Useful for correlation
-      between two specific absorption features across samples.
-
-    Clicking a point (while no pan/zoom tool is active) toggles a persistent
-    annotation.  "Clear labels" removes all annotations.
-
-    **Violin** — one violin per selected band showing the distribution of a
-    chosen metric across all spectra; individual data points overlaid as a
-    jittered strip.
-
-    The window auto-plots the scatter on open.
+    Wraps :func:`~plot.plot_band_parameters` in an interactive tkinter
+    window.  A control panel on the left drives all plot parameters; the
+    matplotlib figure fills the right side and is replaced on each "Plot"
+    call.
 
     Parameters
     ----------
     master : tk.Misc
         Parent widget.
     features : list[dict]
-        Feature definitions (keys: ``'name'``, ``'group'``, ``'wl_range'``).
+        Feature definitions (keys: ``'name'``, ``'wl_range'``, optionally
+        ``'group'``).
     results : dict[str, dict]
         Band parameter results: ``{spectrum_name: {feat_name: dict | None}}``.
     unit : str
-        Wavelength unit for axis labels (``'nm'`` or ``'µm'``).
+        Initial wavelength unit (``'nm'`` or ``'µm'``).
+    sources : dict[str, str] or None
+        Optional mapping of spectrum name → ``'Data'`` / ``'Library'``.
     """
 
     def __init__(
@@ -999,660 +989,221 @@ class BandVizWindow(tk.Toplevel):
     ) -> None:
         super().__init__(master)
         self.title('Band Parameter Visualization')
-        self.geometry('860x860')
+        self.geometry('1100x700')
         self.resizable(True, True)
 
         self._features = features
         self._results  = results
-        self._unit     = unit
-        self._scale    = 1e-3 if unit == 'µm' else 1.0
         self._sources  = sources or {}
+        self._fig: 'plt.Figure | None' = None
 
-        self._metric_labels: dict[str, str] = {
-            k: tmpl.replace('{unit}', unit)
-            for k, tmpl in _METRIC_CLEAN_LABELS.items()
-        }
-        self._label_to_key: dict[str, str] = {v: k for k, v in self._metric_labels.items()}
+        # metric key ↔ display label (unit-aware)
+        self._label_for: dict[str, str] = {}
+        self._key_for:   dict[str, str] = {}
 
-        self._records: list[dict] = self._build_records()
+        self._build(unit)
+        self.after(80, self._plot)
 
-        self._scatter_xdata:        np.ndarray | None = None
-        self._scatter_ydata:        np.ndarray | None = None
-        self._scatter_names:        list[str]  | None = None
-        self._scatter_annotations:  dict               = {}
-        self._scatter_legend_handles: list             = []
-        self._legend_win:           tk.Toplevel | None = None
+    # ── Construction ──────────────────────────────────────────────────────────
 
-        self._build()
-        self.after(60, self._plot_scatter)   # auto-plot on open
+    def _build(self, initial_unit: str) -> None:
+        from .plot import _BP_METRIC_LABELS
 
-    # ── Data ──────────────────────────────────────────────────────────────────
+        def _lbl(key: str, u: str) -> str:
+            return _BP_METRIC_LABELS[key].replace('{unit}', u)
 
-    def _build_records(self) -> list[dict]:
-        """Flatten results into per-(spectrum × band) dicts with pre-scaled values."""
-        records = []
-        for sp_name, feat_results in self._results.items():
-            for feat in self._features:
-                bp = feat_results.get(feat['name'])
-                if bp is None:
-                    continue
-                rec: dict = {
-                    'spectrum': sp_name,
-                    'feature':  feat['name'],
-                    'group':    feat.get('group', ''),
-                    'source':   self._sources.get(sp_name, ''),
-                }
-                for key, _, scaled, _ in _BAND_METRIC_SPEC:
-                    raw = bp.get(key, np.nan)
-                    if raw is None or (isinstance(raw, float) and np.isnan(raw)):
-                        rec[key] = np.nan
-                    else:
-                        rec[key] = float(raw) * (self._scale if scaled else 1.0)
-                records.append(rec)
-        return records
+        for key in _BP_METRIC_LABELS:
+            lbl = _lbl(key, initial_unit)
+            self._label_for[key] = lbl
+            self._key_for[lbl]   = key
 
-    # ── UI construction ───────────────────────────────────────────────────────
-
-    def _build(self) -> None:
-        # ── Shared color scheme selector ──────────────────────────────────────
-        scheme_bar = ttk.Frame(self, padding=(6, 4, 6, 0))
-        scheme_bar.pack(side=tk.TOP, fill=tk.X)
-        ttk.Label(scheme_bar, text='Color scheme:').pack(side=tk.LEFT, padx=(0, 4))
-        self._viz_scheme_var = tk.StringVar(value=list(_COLOR_SCHEMES.keys())[0])
-        _scheme_cb = ttk.Combobox(scheme_bar, textvariable=self._viz_scheme_var,
-                                  values=list(_COLOR_SCHEMES.keys()),
-                                  state='readonly', width=12)
-        _scheme_cb.pack(side=tk.LEFT)
-        _scheme_cb.bind('<<ComboboxSelected>>', lambda _e: self._on_scheme_change())
-
-        self._nb = ttk.Notebook(self)
-        self._nb.pack(fill=tk.BOTH, expand=True, padx=4, pady=(2, 4))
-        self._nb.bind('<<NotebookTabChanged>>', self._on_tab_change)
-
-        scatter_frame = ttk.Frame(self._nb)
-        ridge_frame   = ttk.Frame(self._nb)
-        self._nb.add(scatter_frame, text='Scatter')
-        self._nb.add(ridge_frame,   text='Ridge')
-
-        self._build_scatter_tab(scatter_frame)
-        self._build_ridge_tab(ridge_frame)
-
-    def _build_scatter_tab(self, parent: ttk.Frame) -> None:
-        metric_labels = list(self._metric_labels.values())
+        metric_labels = list(self._label_for.values())
         feat_names    = [f['name'] for f in self._features]
 
-        # ── Row 1: mode radio buttons ──────────────────────────────────────────
-        mode_row = ttk.Frame(parent, padding=(6, 6, 6, 2))
-        mode_row.pack(side=tk.TOP, fill=tk.X)
+        # ── Left control panel ────────────────────────────────────────────
+        ctrl = ttk.Frame(self, padding=(8, 8, 6, 8))
+        ctrl.pack(side=tk.LEFT, fill=tk.Y)
 
-        self._scatter_mode_var = tk.StringVar(value='metric')
-        ttk.Radiobutton(
-            mode_row, text='Metric vs Metric',
-            variable=self._scatter_mode_var, value='metric',
-            command=self._on_scatter_mode_change,
-        ).pack(side=tk.LEFT, padx=(0, 16))
-        ttk.Radiobutton(
-            mode_row, text='Band vs Band',
-            variable=self._scatter_mode_var, value='band',
-            command=self._on_scatter_mode_change,
-        ).pack(side=tk.LEFT)
+        # Kind
+        ttk.Label(ctrl, text='Kind:').pack(anchor='w')
+        self._kind_var = tk.StringVar(value='both')
+        for val, lbl in [('both', 'Both'), ('scatter', 'Scatter'), ('ridge', 'Ridge')]:
+            ttk.Radiobutton(ctrl, text=lbl, variable=self._kind_var,
+                            value=val).pack(anchor='w', padx=6)
 
-        # ── Row 2: swappable controls ──────────────────────────────────────────
-        self._scatter_ctrl_container = ttk.Frame(parent)
-        self._scatter_ctrl_container.pack(side=tk.TOP, fill=tk.X)
+        ttk.Separator(ctrl, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(6, 4))
 
-        # Mode 1: two metric dropdowns + Color by
-        self._ctrl_m1 = ttk.Frame(self._scatter_ctrl_container, padding=(6, 0, 6, 2))
-        ttk.Label(self._ctrl_m1, text='X:').pack(side=tk.LEFT, padx=(0, 2))
-        self._sx_var = tk.StringVar(value=self._metric_labels['band_depth'])
-        _cb = ttk.Combobox(self._ctrl_m1, textvariable=self._sx_var, values=metric_labels,
-                            state='readonly', width=22)
-        _cb.pack(side=tk.LEFT, padx=(0, 10))
-        _cb.bind('<<ComboboxSelected>>', lambda _e: self._plot_scatter())
-        ttk.Label(self._ctrl_m1, text='Y:').pack(side=tk.LEFT, padx=(0, 2))
-        self._sy_var = tk.StringVar(value=self._metric_labels['wl_min'])
-        _cb = ttk.Combobox(self._ctrl_m1, textvariable=self._sy_var, values=metric_labels,
-                            state='readonly', width=22)
-        _cb.pack(side=tk.LEFT, padx=(0, 10))
-        _cb.bind('<<ComboboxSelected>>', lambda _e: self._plot_scatter())
-        ttk.Label(self._ctrl_m1, text='Color by:').pack(side=tk.LEFT, padx=(0, 2))
-        self._sc_var = tk.StringVar(value='Band')
-        _cb = ttk.Combobox(self._ctrl_m1, textvariable=self._sc_var,
-                            values=['Band', 'Feature group', 'None'],
-                            state='readonly', width=13)
-        _cb.pack(side=tk.LEFT)
-        _cb.bind('<<ComboboxSelected>>', lambda _e: self._plot_scatter())
-        self._ctrl_m1.pack(fill=tk.X)   # visible by default
+        # Scatter params
+        sc_lf = ttk.LabelFrame(ctrl, text='Scatter', padding=(4, 2))
+        sc_lf.pack(fill=tk.X, pady=(0, 6))
 
-        # Mode 2: one metric + Band A / Band B dropdowns
-        self._ctrl_m2 = ttk.Frame(self._scatter_ctrl_container, padding=(6, 0, 6, 2))
-        ttk.Label(self._ctrl_m2, text='Metric:').pack(side=tk.LEFT, padx=(0, 2))
-        self._sm_var = tk.StringVar(value=self._metric_labels['band_depth'])
-        _cb = ttk.Combobox(self._ctrl_m2, textvariable=self._sm_var, values=metric_labels,
-                            state='readonly', width=22)
-        _cb.pack(side=tk.LEFT, padx=(0, 10))
-        _cb.bind('<<ComboboxSelected>>', lambda _e: self._plot_scatter())
-        ttk.Label(self._ctrl_m2, text='Band A:').pack(side=tk.LEFT, padx=(0, 2))
-        self._sa_var = tk.StringVar(value=feat_names[0] if feat_names else '')
-        _cb = ttk.Combobox(self._ctrl_m2, textvariable=self._sa_var, values=feat_names,
-                            state='readonly', width=18)
-        _cb.pack(side=tk.LEFT, padx=(0, 10))
-        _cb.bind('<<ComboboxSelected>>', lambda _e: self._plot_scatter())
-        ttk.Label(self._ctrl_m2, text='Band B:').pack(side=tk.LEFT, padx=(0, 2))
-        b_default = feat_names[1] if len(feat_names) > 1 else (feat_names[0] if feat_names else '')
-        self._sb_var = tk.StringVar(value=b_default)
-        _cb = ttk.Combobox(self._ctrl_m2, textvariable=self._sb_var, values=feat_names,
-                            state='readonly', width=18)
-        _cb.pack(side=tk.LEFT)
-        _cb.bind('<<ComboboxSelected>>', lambda _e: self._plot_scatter())
-        # _ctrl_m2 stays hidden until user switches mode
+        ttk.Label(sc_lf, text='X:').grid(row=0, column=0, sticky='w', padx=(0, 4))
+        self._x_var = tk.StringVar(value=self._label_for['band_depth'])
+        self._x_cb  = ttk.Combobox(sc_lf, textvariable=self._x_var,
+                                   values=metric_labels, state='readonly', width=20)
+        self._x_cb.grid(row=0, column=1, sticky='ew')
 
-        # ── Row 3: clear labels + legend mode ──────────────────────────────────
-        btn_row = ttk.Frame(parent, padding=(6, 0, 6, 4))
-        btn_row.pack(side=tk.TOP, fill=tk.X)
-        ttk.Button(btn_row, text='Clear labels',
-                   command=self._clear_scatter_labels).pack(side=tk.LEFT)
-        ttk.Separator(btn_row, orient=tk.VERTICAL).pack(
-            side=tk.LEFT, fill=tk.Y, padx=(12, 8), pady=2)
-        ttk.Label(btn_row, text='Legend:').pack(side=tk.LEFT, padx=(0, 4))
-        self._scatter_legend_var = tk.StringVar(value='inline')
-        for _val, _lbl in [('inline', 'Inline'), ('none', 'None'), ('separate', 'Separate')]:
-            ttk.Radiobutton(btn_row, text=_lbl, variable=self._scatter_legend_var,
-                            value=_val, command=self._plot_scatter).pack(
+        ttk.Label(sc_lf, text='Y:').grid(row=1, column=0, sticky='w',
+                                          padx=(0, 4), pady=(2, 0))
+        self._y_var = tk.StringVar(value=self._label_for['wl_min'])
+        self._y_cb  = ttk.Combobox(sc_lf, textvariable=self._y_var,
+                                   values=metric_labels, state='readonly', width=20)
+        self._y_cb.grid(row=1, column=1, sticky='ew', pady=(2, 0))
+
+        ttk.Label(sc_lf, text='Color:').grid(row=2, column=0, sticky='w',
+                                              padx=(0, 4), pady=(2, 0))
+        self._color_var = tk.StringVar(value='feature')
+        ttk.Combobox(sc_lf, textvariable=self._color_var,
+                     values=['feature', 'group', 'source', 'none'],
+                     state='readonly', width=20).grid(row=2, column=1, sticky='ew',
+                                                      pady=(2, 0))
+        sc_lf.columnconfigure(1, weight=1)
+
+        # Ridge params
+        rd_lf = ttk.LabelFrame(ctrl, text='Ridge', padding=(4, 2))
+        rd_lf.pack(fill=tk.X, pady=(0, 6))
+
+        ttk.Label(rd_lf, text='Metric:').pack(anchor='w')
+        self._rm_var = tk.StringVar(value=self._label_for['band_depth'])
+        self._rm_cb  = ttk.Combobox(rd_lf, textvariable=self._rm_var,
+                                    values=metric_labels, state='readonly', width=20)
+        self._rm_cb.pack(fill=tk.X)
+        self._pts_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(rd_lf, text='Show points',
+                        variable=self._pts_var).pack(anchor='w')
+
+        # Unit
+        unit_lf = ttk.LabelFrame(ctrl, text='Unit', padding=(4, 2))
+        unit_lf.pack(fill=tk.X, pady=(0, 6))
+        self._unit_var = tk.StringVar(value=initial_unit)
+        for val in ('nm', 'µm'):
+            ttk.Radiobutton(unit_lf, text=val, variable=self._unit_var,
+                            value=val, command=self._on_unit_change).pack(
                                 side=tk.LEFT, padx=(0, 8))
 
-        # ── Band selection (Mode 1 only) ───────────────────────────────────────
-        # Container always holds its pack position; inner LF is shown/hidden on mode switch.
-        self._scatter_bands_container = ttk.Frame(parent)
-        self._scatter_bands_container.pack(side=tk.TOP, fill=tk.X)
-        self._scatter_bands_lf = ttk.LabelFrame(self._scatter_bands_container, text='Bands', padding=(4, 2))
-        self._scatter_bands_lf.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(2, 0))
-        lb_inner = ttk.Frame(self._scatter_bands_lf)
-        lb_inner.pack(fill=tk.BOTH)
+        # Feature filter
+        feat_lf = ttk.LabelFrame(ctrl, text='Bands', padding=(4, 2))
+        feat_lf.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+
+        lb_inner = ttk.Frame(feat_lf)
+        lb_inner.pack(fill=tk.BOTH, expand=True)
         lb_vs = ttk.Scrollbar(lb_inner, orient=tk.VERTICAL)
-        self._scatter_bands_lb = tk.Listbox(
-            lb_inner, selectmode=tk.EXTENDED, height=7,
+        self._feat_lb = tk.Listbox(
+            lb_inner, selectmode=tk.EXTENDED, height=6,
             exportselection=False, font=('TkFixedFont', 10),
             yscrollcommand=lb_vs.set,
         )
-        lb_vs.config(command=self._scatter_bands_lb.yview)
-        self._scatter_bands_lb.grid(row=0, column=0, sticky=tk.NSEW)
-        lb_vs.grid(row=0, column=1, sticky=tk.NS)
+        lb_vs.config(command=self._feat_lb.yview)
+        self._feat_lb.grid(row=0, column=0, sticky='nsew')
+        lb_vs.grid(row=0, column=1, sticky='ns')
         lb_inner.columnconfigure(0, weight=1)
-        for feat in self._features:
-            self._scatter_bands_lb.insert(tk.END, feat['name'])
-        self._scatter_bands_lb.select_set(0, tk.END)
-        self._scatter_bands_lb.bind('<<ListboxSelect>>', lambda _e: self._plot_scatter())
-        sel_row = ttk.Frame(self._scatter_bands_lf)
+        lb_inner.rowconfigure(0, weight=1)
+        for name in feat_names:
+            self._feat_lb.insert(tk.END, name)
+        self._feat_lb.select_set(0, tk.END)
+
+        sel_row = ttk.Frame(feat_lf)
         sel_row.pack(fill=tk.X, pady=(2, 0))
-        ttk.Button(sel_row, text='Select All',
-                   command=lambda: (self._scatter_bands_lb.select_set(0, tk.END),
-                                    self._plot_scatter())).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(sel_row, text='All',
+                   command=lambda: self._feat_lb.select_set(0, tk.END)).pack(
+                       side=tk.LEFT, padx=(0, 4))
         ttk.Button(sel_row, text='Clear',
-                   command=lambda: (self._scatter_bands_lb.selection_clear(0, tk.END),
-                                    self._plot_scatter())).pack(side=tk.LEFT)
+                   command=lambda: self._feat_lb.selection_clear(0, tk.END)).pack(
+                       side=tk.LEFT)
 
-        # ── Figure ─────────────────────────────────────────────────────────────
-        self._scatter_fig = Figure(figsize=(7, 6), dpi=100)
-        self._scatter_ax  = self._scatter_fig.add_subplot(111)
-        self._scatter_fig.subplots_adjust(top=0.93, bottom=0.10, left=0.13, right=0.97)
+        # Action buttons
+        ttk.Button(ctrl, text='Plot',    command=self._plot).pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(ctrl, text='Export…', command=self._export).pack(fill=tk.X)
 
-        scatter_canvas = FigureCanvasTkAgg(self._scatter_fig, master=parent)
-        NavigationToolbar2Tk(scatter_canvas, parent)
-        scatter_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        scatter_canvas.draw()
-        self._scatter_canvas = scatter_canvas
-        self._scatter_canvas.mpl_connect('button_press_event', self._on_scatter_click)
+        # ── Right figure area ─────────────────────────────────────────────
+        self._fig_frame = ttk.Frame(self)
+        self._fig_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-    def _on_scatter_mode_change(self) -> None:
-        if self._scatter_mode_var.get() == 'metric':
-            self._ctrl_m2.pack_forget()
-            self._ctrl_m1.pack(fill=tk.X)
-            # Re-pack inside the container (container itself keeps its position)
-            self._scatter_bands_lf.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(2, 0))
-        else:
-            self._ctrl_m1.pack_forget()
-            self._scatter_bands_lf.pack_forget()
-            self._ctrl_m2.pack(fill=tk.X)
-        self._plot_scatter()
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _on_tab_change(self, _event=None) -> None:
-        if self._nb.index(self._nb.select()) == 1:
-            self._plot_ridge()
+    def _on_unit_change(self) -> None:
+        """Rebuild label ↔ key mappings when the unit radio changes."""
+        from .plot import _BP_METRIC_LABELS
 
-    def _on_scheme_change(self) -> None:
-        tab = self._nb.index(self._nb.select())
-        if tab == 0:
-            self._plot_scatter()
-        else:
-            self._plot_ridge()
+        unit = self._unit_var.get()
+        x_key  = self._key_for.get(self._x_var.get(),  'band_depth')
+        y_key  = self._key_for.get(self._y_var.get(),  'wl_min')
+        rm_key = self._key_for.get(self._rm_var.get(), 'band_depth')
 
-    def _open_legend_window(self, handles: list, n_cols: int = 1) -> None:
-        """Open (or refresh) a detached Toplevel showing only the legend."""
-        if self._legend_win is not None:
-            try:
-                self._legend_win.destroy()
-            except tk.TclError:
-                pass
-            self._legend_win = None
+        self._label_for.clear()
+        self._key_for.clear()
+        for key in _BP_METRIC_LABELS:
+            lbl = _BP_METRIC_LABELS[key].replace('{unit}', unit)
+            self._label_for[key] = lbl
+            self._key_for[lbl]   = key
 
-        n_items = len(handles)
-        n_rows  = max(1, -(-n_items // n_cols))   # ceiling division
-        fig_w   = max(2.5, n_cols * 2.8)
-        fig_h   = max(1.2, n_rows * 0.38 + 0.5)
+        metric_labels = list(self._label_for.values())
+        for cb, var, key in [(self._x_cb,  self._x_var,  x_key),
+                             (self._y_cb,  self._y_var,  y_key),
+                             (self._rm_cb, self._rm_var, rm_key)]:
+            cb.configure(values=metric_labels)
+            var.set(self._label_for[key])
 
-        fig = Figure(figsize=(fig_w, fig_h), dpi=100)
-        ax  = fig.add_subplot(111)
-        ax.axis('off')
-        ax.legend(handles=handles, loc='center', fontsize=9,
-                  ncols=n_cols, framealpha=0.9, markerscale=1.3)
-        fig.tight_layout(pad=0.3)
+    # ── Plotting ──────────────────────────────────────────────────────────────
 
-        win = tk.Toplevel(self)
-        win.title('Legend')
-        win.resizable(True, True)
-        canvas = FigureCanvasTkAgg(fig, master=win)
-        NavigationToolbar2Tk(canvas, win)
+    def _plot(self) -> None:
+        unit       = self._unit_var.get()
+        x_key      = self._key_for.get(self._x_var.get(),  'band_depth')
+        y_key      = self._key_for.get(self._y_var.get(),  'wl_min')
+        rm_key     = self._key_for.get(self._rm_var.get(), 'band_depth')
+        kind       = self._kind_var.get()
+        color_by   = self._color_var.get()
+        sel_idx    = list(self._feat_lb.curselection())
+        feat_filter = ([self._features[i]['name'] for i in sel_idx]
+                       if sel_idx else None)
+
+        if self._fig is not None:
+            plt.close(self._fig)
+            self._fig = None
+
+        fig = plot_band_parameters(
+            {'features': self._features,
+             'results':  self._results,
+             'sources':  self._sources},
+            x_metric=x_key,
+            y_metric=y_key,
+            ridge_metric=rm_key,
+            kind=kind,
+            features=feat_filter,
+            color_by=color_by,
+            unit=unit,
+            show_points=self._pts_var.get(),
+            show=False,
+        )
+        if fig is None:
+            return
+
+        self._fig = fig
+
+        for widget in self._fig_frame.winfo_children():
+            widget.destroy()
+
+        canvas = FigureCanvasTkAgg(fig, master=self._fig_frame)
+        NavigationToolbar2Tk(canvas, self._fig_frame)
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         canvas.draw()
-        win.geometry(f'{int(fig_w * 100 + 20)}x{int(fig_h * 100 + 56)}')
-        self._legend_win = win
 
-    def _build_ridge_tab(self, parent: ttk.Frame) -> None:
-        metric_labels = list(self._metric_labels.values())
-
-        ctrl = ttk.Frame(parent, padding=(6, 6, 6, 0))
-        ctrl.pack(side=tk.TOP, fill=tk.X)
-        ttk.Label(ctrl, text='Metric:').pack(side=tk.LEFT, padx=(0, 2))
-        self._vm_var = tk.StringVar(value=self._metric_labels['band_depth'])
-        _cb = ttk.Combobox(ctrl, textvariable=self._vm_var, values=metric_labels,
-                            state='readonly', width=24)
-        _cb.pack(side=tk.LEFT, padx=(0, 10))
-        _cb.bind('<<ComboboxSelected>>', lambda _e: self._plot_ridge())
-        self._vp_var = tk.BooleanVar(value=True)
-        self._vp_var.trace_add('write', lambda *_: self._plot_ridge())
-        ttk.Checkbutton(ctrl, text='Show points',
-                        variable=self._vp_var).pack(side=tk.LEFT, padx=(0, 10))
-
-        lb_outer = ttk.LabelFrame(parent, text='Bands', padding=(4, 2))
-        lb_outer.pack(side=tk.TOP, fill=tk.X, padx=4, pady=(4, 0))
-        lb_inner = ttk.Frame(lb_outer)
-        lb_inner.pack(fill=tk.BOTH)
-        lb_vs = ttk.Scrollbar(lb_inner, orient=tk.VERTICAL)
-        self._ridge_lb = tk.Listbox(
-            lb_inner, selectmode=tk.EXTENDED, height=7,
-            exportselection=False, font=('TkFixedFont', 10),
-            yscrollcommand=lb_vs.set,
+    def _export(self) -> None:
+        from .utils import save_band_parameters_csv
+        path = filedialog.asksaveasfilename(
+            parent=self, defaultextension='.csv',
+            filetypes=[('CSV files', '*.csv'), ('All files', '*.*')],
+            title='Export band parameters',
         )
-        lb_vs.config(command=self._ridge_lb.yview)
-        self._ridge_lb.grid(row=0, column=0, sticky=tk.NSEW)
-        lb_vs.grid(row=0, column=1, sticky=tk.NS)
-        lb_inner.columnconfigure(0, weight=1)
-        for feat in self._features:
-            self._ridge_lb.insert(tk.END, feat['name'])
-        self._ridge_lb.select_set(0, tk.END)
-        self._ridge_lb.bind('<<ListboxSelect>>', lambda _e: self._plot_ridge())
-
-        sel_row = ttk.Frame(lb_outer)
-        sel_row.pack(fill=tk.X, pady=(2, 0))
-        ttk.Button(sel_row, text='Select All',
-                   command=lambda: (self._ridge_lb.select_set(0, tk.END),
-                                    self._plot_ridge())).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(sel_row, text='Clear',
-                   command=lambda: (self._ridge_lb.selection_clear(0, tk.END),
-                                    self._plot_ridge())).pack(side=tk.LEFT)
-
-        self._ridge_fig = Figure(figsize=(7, 5), dpi=100)
-        self._ridge_ax  = self._ridge_fig.add_subplot(111)
-        self._ridge_fig.subplots_adjust(top=0.93, bottom=0.08, left=0.28, right=0.97)
-
-        violin_canvas = FigureCanvasTkAgg(self._ridge_fig, master=parent)
-        NavigationToolbar2Tk(violin_canvas, parent)
-        violin_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        violin_canvas.draw()
-        self._ridge_canvas = violin_canvas
-
-    # ── Scatter plotting ──────────────────────────────────────────────────────
-
-    def _plot_scatter(self) -> None:
-        ax = self._scatter_ax
-        ax.cla()
-        self._clear_scatter_labels(redraw=False)
-        if self._scatter_mode_var.get() == 'metric':
-            self._plot_scatter_metric(ax)
-        else:
-            self._plot_scatter_band(ax)
-        self._scatter_canvas.draw_idle()
-
-    def _plot_scatter_metric(self, ax) -> None:
-        """Mode 1: (spectrum × band) pairs; X and Y are independent metrics."""
-        x_key = self._label_to_key.get(self._sx_var.get())
-        y_key = self._label_to_key.get(self._sy_var.get())
-        if x_key is None or y_key is None:
+        if not path:
             return
-
-        sel_idx = list(self._scatter_bands_lb.curselection())
-        selected_feats = {self._features[i]['name'] for i in sel_idx}
-        valid = [r for r in self._records
-                 if r['feature'] in selected_feats
-                 and not (np.isnan(r.get(x_key, np.nan)) or
-                          np.isnan(r.get(y_key, np.nan)))]
-        if not valid:
-            ax.text(0.5, 0.5, 'No data', transform=ax.transAxes,
-                    ha='center', va='center', color='gray')
-            return
-
-        color_by = self._sc_var.get()
-        _palette = _COLOR_SCHEMES[self._viz_scheme_var.get()]
-
-        _src_markers: dict[str, str] = {'Data': 'o', 'Library': '^', '': 'o'}
-        mixed_sources = len({r.get('source', '') for r in valid} - {''}) > 1
-
-        def _scatter_pts(pts: list[dict], color) -> None:
-            """Draw pts split by source so marker shapes are correct; no labels."""
-            for src, mkr in _src_markers.items():
-                sub = [r for r in pts if r.get('source', '') == src]
-                if sub:
-                    ax.scatter([r[x_key] for r in sub], [r[y_key] for r in sub],
-                               marker=mkr, s=30, alpha=0.75, color=color)
-
-        color_handles: list = []
-        n_cols = 1
-
-        if color_by == 'Band':
-            feats   = [f['name'] for f in self._features]
-            f_color = {f: _palette[i % len(_palette)] for i, f in enumerate(feats)}
-            for f in feats:
-                pts = [r for r in valid if r['feature'] == f]
-                if pts:
-                    _scatter_pts(pts, f_color[f])
-                    color_handles.append(
-                        Line2D([0], [0], marker='s', linestyle='none',
-                               color=f_color[f], markersize=7, label=f)
-                    )
-            n_cols = max(1, len(color_handles) // 12)
-        elif color_by == 'Feature group':
-            groups  = sorted(set(r['group'] for r in valid))
-            g_color = {g: _dark2[i % len(_dark2)] for i, g in enumerate(groups)}
-            for g in groups:
-                pts = [r for r in valid if r['group'] == g]
-                _scatter_pts(pts, g_color[g])
-                color_handles.append(
-                    Line2D([0], [0], marker='s', linestyle='none',
-                           color=g_color[g], markersize=7,
-                           label=g if g else '(none)')
-                )
-        else:
-            _scatter_pts(valid, 'steelblue')
-
-        # Prepend source-shape handles when both Data and Library are present
-        if mixed_sources:
-            src_handles = [
-                Line2D([0], [0], marker='o', linestyle='none', color='gray',
-                       markersize=6, label='Data'),
-                Line2D([0], [0], marker='^', linestyle='none', color='gray',
-                       markersize=6, label='Library'),
-            ]
-            all_handles = src_handles + color_handles
-        else:
-            all_handles = color_handles
-
-        self._scatter_legend_handles = all_handles
-
-        if all_handles:
-            legend_mode = self._scatter_legend_var.get()
-            if legend_mode == 'inline':
-                ax.legend(handles=all_handles, fontsize=8, markerscale=1.1,
-                          loc='best', framealpha=0.7, ncols=n_cols)
-            elif legend_mode == 'separate':
-                self._open_legend_window(all_handles, n_cols)
-
-        self._scatter_xdata = np.array([r[x_key] for r in valid])
-        self._scatter_ydata = np.array([r[y_key] for r in valid])
-        self._scatter_names = [f"{r['spectrum']}  [{r['feature']}]" for r in valid]
-
-        ax.set_xlabel(self._sx_var.get(), fontsize=11)
-        ax.set_ylabel(self._sy_var.get(), fontsize=11)
-        ax.set_title(f"{self._sx_var.get()} vs {self._sy_var.get()}", fontsize=11)
-        ax.grid(True, linestyle='--', alpha=0.3)
-
-    def _plot_scatter_band(self, ax) -> None:
-        """Mode 2: one point per spectrum; X = Band A metric, Y = Band B metric."""
-        metric_key = self._label_to_key.get(self._sm_var.get())
-        band_a     = self._sa_var.get()
-        band_b     = self._sb_var.get()
-        if metric_key is None or not band_a or not band_b:
-            return
-
-        # Aggregate per-spectrum per-band values (include source)
-        sp_vals:   dict[str, dict[str, float]] = {}
-        sp_source: dict[str, str]              = {}
-        for r in self._records:
-            sp_vals.setdefault(r['spectrum'], {})[r['feature']] = r.get(metric_key, np.nan)
-            sp_source[r['spectrum']] = r.get('source', '')
-
-        xs, ys, names, srcs = [], [], [], []
-        for sp, fv in sp_vals.items():
-            x = fv.get(band_a, np.nan)
-            y = fv.get(band_b, np.nan)
-            if not np.isnan(x) and not np.isnan(y):
-                xs.append(float(x))
-                ys.append(float(y))
-                names.append(sp)
-                srcs.append(sp_source.get(sp, ''))
-
-        if not xs:
-            ax.text(0.5, 0.5, 'No data', transform=ax.transAxes,
-                    ha='center', va='center', color='gray')
-            return
-
-        xs_arr = np.array(xs)
-        ys_arr = np.array(ys)
-        srcs_arr = np.array(srcs)
-        _src_markers = {'Data': 'o', 'Library': '^', '': 'o'}
-        mixed_sources = len(set(srcs) - {''}) > 1
-        for src, mkr in _src_markers.items():
-            idx = np.where(srcs_arr == src)[0]
-            if not len(idx):
-                continue
-            lbl = src if (mixed_sources and src) else None
-            ax.scatter(xs_arr[idx], ys_arr[idx],
-                       marker=mkr, s=35, alpha=0.75, color='steelblue', label=lbl)
-        if mixed_sources:
-            ax.legend(fontsize=8, markerscale=1.1, loc='best', framealpha=0.7)
-
-        self._scatter_xdata = xs_arr
-        self._scatter_ydata = ys_arr
-        self._scatter_names = names
-
-        metric_label = self._sm_var.get()
-        ax.set_xlabel(f'{band_a}  —  {metric_label}', fontsize=11)
-        ax.set_ylabel(f'{band_b}  —  {metric_label}', fontsize=11)
-        ax.set_title(f'{metric_label}: {band_a} vs {band_b}', fontsize=11)
-        ax.grid(True, linestyle='--', alpha=0.3)
-
-    def _on_scatter_click(self, event) -> None:
-        if event.inaxes != self._scatter_ax:
-            return
-        if self._scatter_canvas.toolbar.mode != '':
-            return
-        if self._scatter_xdata is None or len(self._scatter_xdata) == 0:
-            return
-
-        xy_disp    = self._scatter_ax.transData.transform(
-            np.column_stack([self._scatter_xdata, self._scatter_ydata]))
-        click_disp = np.array([event.x, event.y])
-        dists      = np.linalg.norm(xy_disp - click_disp, axis=1)
-        idx        = int(np.argmin(dists))
-        if dists[idx] > 15:
-            return
-
-        name = self._scatter_names[idx]
-        if name in self._scatter_annotations:
-            self._scatter_annotations.pop(name).remove()
-        else:
-            ann = self._scatter_ax.annotate(
-                name,
-                xy=(self._scatter_xdata[idx], self._scatter_ydata[idx]),
-                xytext=(6, 6), textcoords='offset points',
-                fontsize=8, clip_on=True,
-                bbox=dict(boxstyle='round,pad=0.25',
-                          fc='lightyellow', alpha=0.85, lw=0.5),
-            )
-            self._scatter_annotations[name] = ann
-        self._scatter_canvas.draw_idle()
-
-    def _clear_scatter_labels(self, redraw: bool = True) -> None:
-        for ann in list(self._scatter_annotations.values()):
-            ann.remove()
-        self._scatter_annotations.clear()
-        if redraw:
-            self._scatter_canvas.draw_idle()
-
-    # ── Ridge plotting ────────────────────────────────────────────────────────
-
-    def _plot_ridge(self) -> None:
-        from matplotlib.patches import Patch
-        ax = self._ridge_ax
-        ax.cla()
-
-        metric_key = self._label_to_key.get(self._vm_var.get())
-        if metric_key is None:
-            self._ridge_canvas.draw_idle()
-            return
-
-        sel_idx = list(self._ridge_lb.curselection())
-        if not sel_idx:
-            messagebox.showinfo('Ridge Plot', 'Select at least one band.', parent=self)
-            return
-
-        feat_names = [self._features[i]['name'] for i in sel_idx]
-
-        # Detect whether both Data and Library are present in records
-        all_rec_sources = {r.get('source', '') for r in self._records} - {''}
-        mixed_sources   = len(all_rec_sources) > 1
-
-        # Build per-band value arrays, split by source when mixed
-        plot_names: list[str]        = []
-        plot_d:     list[np.ndarray] = []   # Data vals (or all vals when not mixed)
-        plot_l:     list[np.ndarray] = []   # Library vals (empty when not mixed)
-
-        for name in feat_names:
-            recs = [r for r in self._records
-                    if r['feature'] == name
-                    and not np.isnan(r.get(metric_key, np.nan))]
-            all_arr = np.array([r[metric_key] for r in recs])
-            if len(all_arr) < 2:
-                continue
-            if mixed_sources:
-                d_arr = np.array([r[metric_key] for r in recs if r.get('source') == 'Data'])
-                l_arr = np.array([r[metric_key] for r in recs if r.get('source') == 'Library'])
-            else:
-                d_arr = all_arr
-                l_arr = np.array([])
-            plot_names.append(name)
-            plot_d.append(d_arr)
-            plot_l.append(l_arr)
-
-        if not plot_names:
-            ax.text(0.5, 0.5,
-                    'Insufficient data\n(need ≥ 2 spectra per band)',
-                    transform=ax.transAxes, ha='center', va='center', color='gray')
-            self._ridge_canvas.draw_idle()
-            return
-
-        n            = len(plot_names)
-        scheme       = _COLOR_SCHEMES[self._viz_scheme_var.get()]
-        colors       = [scheme[i % len(scheme)] for i in range(n)]
-        band_spacing = 1.0
-        kde_height   = 0.70
-        cloud_height = 0.28
-
-        all_chunks = [v for v in plot_d + plot_l if len(v)]
-        all_vals   = np.concatenate(all_chunks)
-        x_margin   = max((all_vals.max() - all_vals.min()) * 0.08, 1e-6)
-        x_range    = np.linspace(all_vals.min() - x_margin,
-                                 all_vals.max() + x_margin, 400)
-
-        rng      = np.random.default_rng(seed=0)
-        show_pts = self._vp_var.get()
-
-        def _draw_kde(vals: np.ndarray, baseline: float, color,
-                      hatch: str | None = None) -> None:
-            if len(vals) < 2:
-                return
-            kde = gaussian_kde(vals, bw_method='scott')
-            ky  = kde(x_range)
-            ky  = ky / ky.max() * kde_height
-            if hatch:
-                ax.fill_between(x_range, baseline, baseline + ky,
-                                color=color, alpha=0.18, hatch=hatch, zorder=2)
-                ax.plot(x_range, baseline + ky,
-                        color=color, linewidth=1.4, linestyle='--', alpha=0.85, zorder=3)
-            else:
-                ax.fill_between(x_range, baseline, baseline + ky,
-                                color=color, alpha=0.45, zorder=2)
-                ax.plot(x_range, baseline + ky,
-                        color=color, linewidth=1.4, alpha=0.9, zorder=3)
-
-        baselines: list[float] = []
-        for i, (name, d_vals, l_vals, color) in enumerate(
-                zip(plot_names, plot_d, plot_l, colors)):
-            baseline = float((n - 1 - i) * band_spacing)
-            baselines.append(baseline)
-
-            ax.axhline(baseline, color=color, linewidth=0.6, alpha=0.35, zorder=1)
-
-            if mixed_sources:
-                _draw_kde(d_vals, baseline, color, hatch=None)      # Data: solid
-                _draw_kde(l_vals, baseline, color, hatch='///')      # Library: hatched
-                if show_pts:
-                    if len(d_vals):
-                        jitter = rng.uniform(-cloud_height, 0.0, len(d_vals))
-                        ax.scatter(d_vals, baseline + jitter,
-                                   s=4, marker='o', alpha=0.5, color=color,
-                                   linewidths=0, zorder=4)
-                    if len(l_vals):
-                        jitter = rng.uniform(-cloud_height, 0.0, len(l_vals))
-                        ax.scatter(l_vals, baseline + jitter,
-                                   s=9, marker='^', alpha=0.5, color=color,
-                                   linewidths=0, zorder=4)
-            else:
-                _draw_kde(d_vals, baseline, color, hatch=None)
-                if show_pts:
-                    jitter = rng.uniform(-cloud_height, 0.0, len(d_vals))
-                    ax.scatter(d_vals, baseline + jitter,
-                               s=4, alpha=0.45, color=color,
-                               linewidths=0, zorder=4)
-
-        ax.set_yticks(baselines)
-        ax.set_yticklabels(plot_names, fontsize=9)
-        ax.tick_params(axis='y', length=0)
-        ax.set_ylim(-cloud_height - 0.15,
-                    (n - 1) * band_spacing + kde_height + 0.15)
-
-        ax.set_xlabel(self._vm_var.get(), fontsize=11)
-        ax.set_title(f'Distribution of {self._vm_var.get()} by band', fontsize=11)
-        ax.xaxis.grid(True, linestyle='--', alpha=0.4)
-        ax.set_axisbelow(True)
-        for spine in ('left', 'right', 'top'):
-            ax.spines[spine].set_visible(False)
-
-        if mixed_sources:
-            legend_handles = [
-                Patch(facecolor='gray', alpha=0.55, label='Data'),
-                Patch(facecolor='gray', alpha=0.25, hatch='///', label='Library'),
-            ]
-            ax.legend(handles=legend_handles, fontsize=8,
-                      loc='upper right', framealpha=0.7)
-
-        n_skipped = len(feat_names) - len(plot_names)
-        if n_skipped:
-            ax.text(0.99, 0.99, f'{n_skipped} band(s) skipped (< 2 spectra)',
-                    transform=ax.transAxes, ha='right', va='top',
-                    fontsize=8, color='gray')
-
-        self._ridge_canvas.draw_idle()
+        save_band_parameters_csv(
+            {'features': self._features,
+             'results':  self._results,
+             'sources':  self._sources},
+            path,
+            unit=self._unit_var.get(),
+        )
 
 
 class BandResultsWindow(tk.Toplevel):
@@ -3664,7 +3215,7 @@ class ReflectanceVSWIR(tk.Tk):
         if self._bp_features is None or self._bp_results is None:
             return
         from tkinter import filedialog
-        import csv
+        from .utils import save_band_parameters_csv
         path = filedialog.asksaveasfilename(
             parent=self, defaultextension='.csv',
             filetypes=[('CSV files', '*.csv'), ('All files', '*.*')],
@@ -3672,32 +3223,16 @@ class ReflectanceVSWIR(tk.Tk):
         )
         if not path:
             return
-        unit  = self._bp_unit or 'nm'
-        scale = 1e-3 if unit == 'µm' else 1.0
-        sources = self._bp_sources or {}
-        with open(path, 'w', newline='', encoding='utf-8') as fh:
-            writer = csv.writer(fh)
-            header = ['Spectrum', 'Source']
-            for feat in self._bp_features:
-                n = feat['name']
-                for key, tmpl, scaled, _ in _BAND_METRIC_SPEC:
-                    lbl = tmpl.format(unit=unit) if scaled else tmpl
-                    header.append(f'{n} {lbl.replace(chr(10), " ")}')
-            writer.writerow(header)
-            for sp_name, feat_results in self._bp_results.items():
-                row: list = [sp_name, sources.get(sp_name, '')]
-                for feat in self._bp_features:
-                    bp = feat_results.get(feat['name'])
-                    if bp is None:
-                        row += [''] * len(_BAND_METRIC_SPEC)
-                    else:
-                        for key, _, scaled, _ in _BAND_METRIC_SPEC:
-                            val = bp.get(key)
-                            if val is None or (isinstance(val, float) and np.isnan(val)):
-                                row.append('')
-                            else:
-                                row.append(val * scale if scaled else val)
-                writer.writerow(row)
+        unit = self._bp_unit or 'nm'
+        save_band_parameters_csv(
+            {
+                'features': self._bp_features,
+                'results':  self._bp_results,
+                'sources':  self._bp_sources or {},
+            },
+            path,
+            unit=unit,
+        )
         self._set_status(f'Band parameters saved — {Path(path).name}')
 
     def _on_visualize_band_params(self) -> None:
@@ -3725,12 +3260,20 @@ class ReflectanceVSWIR(tk.Tk):
                                 'No spectra are plotted.', parent=self)
             return
 
+        if self._data_pool:
+            _xmins = [float(e['xaxis'].min()) for e in self._data_pool]
+            _xmaxs = [float(e['xaxis'].max()) for e in self._data_pool]
+            all_data_range: tuple[float, float] | None = (min(_xmins), max(_xmaxs))
+        else:
+            all_data_range = None
+
         dlg = BandIdentificationDialog(
             self, all_items,
             n_data_plotted=len(self._data_plot_items),
             n_data_available=len(self._data_pool),
             n_lib_plotted=len(self._lib_plot_items),
             n_lib_available=len(self._filtered_ids),
+            all_data_range=all_data_range,
         )
         if dlg.cancelled:
             return
@@ -3766,14 +3309,16 @@ class ReflectanceVSWIR(tk.Tk):
         n_proc = len(to_process)
 
         # ── Run detection ─────────────────────────────────────────────────────
+        wl_lo, wl_hi = dlg.wl_range
         raw_results: list[tuple[str, list[dict]]] = []
         for i, entry in enumerate(to_process):
             self._set_status(f'Detecting bands — {i + 1}/{n_proc}')
             xaxis    = entry['xaxis']
             raw      = self._display_data(entry) if 'color' in entry else entry['data']
             spectrum = raw if entry['kind'] == 'single' else np.median(raw, axis=0)
+            mask     = (xaxis >= wl_lo) & (xaxis <= wl_hi)
             candidates = detect_bands(
-                xaxis, spectrum, self._preset_data,
+                xaxis[mask], spectrum[mask], self._preset_data,
                 smooth_method=params['smooth_method'],
                 smooth_window_nm=params['smooth_window_nm'],
                 smooth_polyorder=params['smooth_polyorder'],
@@ -3856,7 +3401,8 @@ class ReflectanceVSWIR(tk.Tk):
             if not path:
                 return
             try:
-                xaxis, spectra = _read_vswir_asd(Path(path))
+                data = load_reflectance_vswir(Path(path), fmt='asd')
+                xaxis, spectra = data['xaxis'], data['spectra']
             except ValueError as exc:
                 messagebox.showerror('Load Data', str(exc), parent=self)
                 return
@@ -3898,7 +3444,8 @@ class ReflectanceVSWIR(tk.Tk):
         """
         self._set_status(f'Loading {path.name}…')
         try:
-            xaxis, spectra = _read_vswir_csv(path)
+            data = load_reflectance_vswir(path, fmt='csv')
+            xaxis, spectra = data['xaxis'], data['spectra']
         except ValueError as exc:
             self._set_status('')
             messagebox.showerror('Load Data', str(exc), parent=self)

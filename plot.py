@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Plotting functions for emcal, tracal, and sma outputs.
+Plotting functions for emcal, tracal, sma, and VSWIR band-parameter outputs.
 
 Called automatically from emcal(), tracal(), and sma() when plot=True.
 Can also be called directly on saved output dicts.
@@ -11,6 +11,7 @@ Provides
 plot_emcal               Summary emissivity plot (+ optional radiance details panel).
 plot_tracal              Two-panel transmittance summary plot.
 plot_sma                 Per-sample spectral mixture analysis overlay plots.
+plot_band_parameters     Scatter + ridge plots for band_parameters_batch() output.
 plot_instrument_metrics  Temperature channels and BB resistance vs. time (dict or CSV path).
 """
 
@@ -48,6 +49,23 @@ _PLOT_COLORS: list = (
     + [plt.cm.tab20b(i) for i in range(1, 20, 2)]
 )
 _PLOT_COLOR_OTHER = '#cccccc'
+
+# Band-parameter metric registry: (key, display_label_template, is_wavelength_metric)
+# Display labels use '{unit}' as a placeholder replaced at call time.
+_BP_METRICS: list[tuple[str, str, bool]] = [
+    ('wl_center',          'Band center ({unit})',  True),
+    ('wl_min',             'Band min ({unit})',     True),
+    ('band_depth',         'Depth',                 False),
+    ('fwhm',               'FWHM ({unit})',         True),
+    ('base_width',         'Base width ({unit})',   True),
+    ('band_area',          'Band area ({unit})',    True),
+    ('band_area_ratio',    'Area ratio',            False),
+    ('asymmetry_hw',       'Asymmetry (HW)',        False),
+    ('asymmetry_centroid', 'Asymmetry (centroid)',  False),
+]
+_BP_METRIC_KEYS:   list[str]      = [k         for k, _, _   in _BP_METRICS]
+_BP_METRIC_LABELS: dict[str, str] = {k: lbl    for k, lbl, _ in _BP_METRICS}
+_BP_METRIC_SCALED: set[str]       = {k         for k, _, sc  in _BP_METRICS if sc}
 
 
 def _fw(x: float) -> float:
@@ -943,6 +961,327 @@ def plot_sma(
 
     _refresh(0)
     plt.show()
+
+
+# =============================================================================
+# plot_band_parameters
+# =============================================================================
+
+def plot_band_parameters(
+    results:      'dict | str | os.PathLike',
+    *,
+    x_metric:     str              = 'band_depth',
+    y_metric:     str              = 'wl_min',
+    ridge_metric: str              = 'band_depth',
+    kind:         str              = 'both',
+    features:     list[str] | None = None,
+    color_by:     str              = 'feature',
+    unit:         str              = 'nm',
+    show_points:  bool             = True,
+    save_path:    'str | None'     = None,
+    show:         bool             = True,
+) -> 'plt.Figure | None':
+    """
+    Scatter and / or ridge plots of band-parameter results.
+
+    Accepts the dict returned by :func:`~functions.band_parameters_batch` or a
+    path to a CSV file previously exported by
+    :func:`~utils.save_band_parameters_csv`.
+
+    Parameters
+    ----------
+    results : dict or path-like
+        Output dict from :func:`~functions.band_parameters_batch` with keys
+        ``'features'``, ``'results'``, and optionally ``'sources'``.  When a
+        file path is given, :func:`~utils.load_band_parameters_csv` is called
+        to reconstruct the same structure.
+    x_metric : str
+        Metric plotted on the scatter X-axis (default ``'band_depth'``).
+        Valid keys: ``'wl_center'``, ``'wl_min'``, ``'band_depth'``,
+        ``'fwhm'``, ``'base_width'``, ``'band_area'``, ``'band_area_ratio'``,
+        ``'asymmetry_hw'``, ``'asymmetry_centroid'``.
+    y_metric : str
+        Metric plotted on the scatter Y-axis (default ``'wl_min'``).
+    ridge_metric : str
+        Metric whose distribution is shown in the ridge plot
+        (default ``'band_depth'``).
+    kind : str
+        Which panels to draw.  ``'scatter'``, ``'ridge'``, or ``'both'``
+        (default).
+    features : list[str] or None
+        Restrict the plot to this subset of feature names.  ``None`` includes
+        all features in *results*.
+    color_by : str
+        Colour scheme for the scatter plot.  One of ``'feature'`` (default,
+        one colour per band name), ``'group'`` (one colour per feature group),
+        ``'source'`` (Data vs Library), or ``'none'`` (uniform steelblue).
+    unit : str
+        Wavelength unit for axis labels — ``'nm'`` or ``'µm'``.  When
+        ``'µm'``, all wavelength-valued metrics are divided by 1000.
+    show_points : bool
+        Overlay individual data points as a jitter strip on the ridge plot
+        (default True).
+    save_path : str or None
+        Path to save the figure (PNG / PDF / SVG …).  When ``None`` (default)
+        the figure is displayed interactively.
+    """
+    from pathlib import Path as _Path
+    from matplotlib.lines import Line2D
+
+    # ── Resolve input ─────────────────────────────────────────────────────────
+    if isinstance(results, (str, _Path, os.PathLike)):
+        try:
+            from .utils import load_band_parameters_csv
+        except ImportError:
+            raise NotImplementedError(
+                "CSV loading requires speclab.utils.load_band_parameters_csv "
+                "(not yet implemented). Pass the dict from band_parameters_batch() directly."
+            )
+        out = load_band_parameters_csv(_Path(results))
+    else:
+        out = results
+
+    feat_list: list[dict] = list(out['features'])
+    res_dict:  dict       = out['results']
+    sources:   dict       = out.get('sources', {})
+
+    if features is not None:
+        _keep = set(features)
+        feat_list = [f for f in feat_list if f['name'] in _keep]
+
+    if not feat_list:
+        logging.warning("plot_band_parameters: no features to plot.")
+        return
+
+    # ── Validate metric keys ──────────────────────────────────────────────────
+    for _k, _param in [(x_metric, 'x_metric'), (y_metric, 'y_metric'),
+                       (ridge_metric, 'ridge_metric')]:
+        if _k not in _BP_METRIC_KEYS:
+            raise ValueError(
+                f"{_param}='{_k}' is not a recognised metric. "
+                f"Choose from: {_BP_METRIC_KEYS}"
+            )
+
+    # ── Build flat records ────────────────────────────────────────────────────
+    scale = 1e-3 if unit == 'µm' else 1.0
+
+    def _lbl(key: str) -> str:
+        return _BP_METRIC_LABELS[key].replace('{unit}', unit)
+
+    records: list[dict] = []
+    for sp_name, feat_results in res_dict.items():
+        for feat in feat_list:
+            bp = feat_results.get(feat['name'])
+            if bp is None:
+                continue
+            rec: dict = {
+                'spectrum': sp_name,
+                'feature':  feat['name'],
+                'group':    feat.get('group', ''),
+                'source':   sources.get(sp_name, ''),
+            }
+            for key in _BP_METRIC_KEYS:
+                raw = bp.get(key, np.nan)
+                if raw is None or (isinstance(raw, float) and np.isnan(raw)):
+                    rec[key] = np.nan
+                else:
+                    rec[key] = float(raw) * (scale if key in _BP_METRIC_SCALED else 1.0)
+            records.append(rec)
+
+    if not records:
+        logging.warning("plot_band_parameters: all band-parameter results are None.")
+        return
+
+    # ── Scatter panel ─────────────────────────────────────────────────────────
+    def _plot_scatter(ax: plt.Axes) -> None:
+        valid = [r for r in records
+                 if not (np.isnan(r.get(x_metric, np.nan))
+                         or np.isnan(r.get(y_metric, np.nan)))]
+        if not valid:
+            ax.text(0.5, 0.5, 'No data', transform=ax.transAxes,
+                    ha='center', va='center', color='gray')
+            return
+
+        feat_names   = [f['name'] for f in feat_list]
+        mixed_src    = len({r.get('source', '') for r in valid} - {''}) > 1
+        _src_markers = {'Data': 'o', 'Library': '^', '': 'o'}
+
+        def _scatter_pts(pts: list[dict], color) -> None:
+            for src, mkr in _src_markers.items():
+                sub = [r for r in pts if r.get('source', '') == src]
+                if sub:
+                    ax.scatter([r[x_metric] for r in sub],
+                               [r[y_metric]  for r in sub],
+                               marker=mkr, s=30, alpha=0.75, color=color)
+
+        legend_handles: list = []
+        n_cols = 1
+
+        if color_by == 'feature':
+            f_color = {f: _PLOT_COLORS[i % len(_PLOT_COLORS)]
+                       for i, f in enumerate(feat_names)}
+            for f in feat_names:
+                pts = [r for r in valid if r['feature'] == f]
+                if pts:
+                    _scatter_pts(pts, f_color[f])
+                    legend_handles.append(
+                        Line2D([0], [0], marker='s', linestyle='none',
+                               color=f_color[f], markersize=7, label=f)
+                    )
+            n_cols = max(1, len(legend_handles) // 12)
+
+        elif color_by == 'group':
+            groups  = sorted(set(r['group'] for r in valid))
+            g_color = {g: _PLOT_COLORS[i % len(_PLOT_COLORS)]
+                       for i, g in enumerate(groups)}
+            for g in groups:
+                pts = [r for r in valid if r['group'] == g]
+                _scatter_pts(pts, g_color[g])
+                legend_handles.append(
+                    Line2D([0], [0], marker='s', linestyle='none',
+                           color=g_color[g], markersize=7,
+                           label=g if g else '(no group)')
+                )
+
+        elif color_by == 'source':
+            src_color = {'Data': _PLOT_COLORS[0], 'Library': _PLOT_COLORS[2], '': 'steelblue'}
+            srcs_present = sorted(set(r.get('source', '') for r in valid) - {''}) or ['']
+            for src in srcs_present:
+                pts = [r for r in valid if r.get('source', '') == src]
+                ax.scatter([r[x_metric] for r in pts], [r[y_metric] for r in pts],
+                           s=30, alpha=0.75, color=src_color.get(src, 'steelblue'),
+                           label=src if src else 'Unknown')
+                legend_handles.append(
+                    Line2D([0], [0], marker='s', linestyle='none',
+                           color=src_color.get(src, 'steelblue'),
+                           markersize=7, label=src if src else 'Unknown')
+                )
+
+        else:  # 'none'
+            _scatter_pts(valid, 'steelblue')
+
+        # Source-shape legend when both Data and Library are present
+        if mixed_src and color_by not in ('source', 'none'):
+            shape_handles = [
+                Line2D([0], [0], marker='o', linestyle='none', color='gray',
+                       markersize=6, label='Data'),
+                Line2D([0], [0], marker='^', linestyle='none', color='gray',
+                       markersize=6, label='Library'),
+            ]
+            legend_handles = shape_handles + legend_handles
+
+        if legend_handles:
+            ax.legend(handles=legend_handles, fontsize=8, markerscale=1.1,
+                      loc='best', framealpha=0.7, ncols=n_cols)
+
+        ax.set_xlabel(_lbl(x_metric),  fontsize=11)
+        ax.set_ylabel(_lbl(y_metric),  fontsize=11)
+        ax.set_title(f'{_lbl(x_metric)} vs {_lbl(y_metric)}', fontsize=11)
+
+    # ── Ridge panel ───────────────────────────────────────────────────────────
+    def _plot_ridge(ax: plt.Axes) -> None:
+        from scipy.stats import gaussian_kde
+
+        feat_names = [f['name'] for f in feat_list]
+        n          = len(feat_names)
+        colors     = [_PLOT_COLORS[i % len(_PLOT_COLORS)] for i in range(n)]
+
+        band_spacing = 1.0
+        kde_height   = 0.70
+        cloud_height = 0.28
+
+        # Collect per-feature value arrays (filter out nan)
+        plot_d:  list[np.ndarray] = []
+        for name in feat_names:
+            vals = np.array([
+                r[ridge_metric] for r in records
+                if r['feature'] == name
+                and not np.isnan(r.get(ridge_metric, np.nan))
+            ])
+            plot_d.append(vals)
+
+        all_chunks = [v for v in plot_d if len(v)]
+        if not all_chunks:
+            ax.text(0.5, 0.5, 'No data', transform=ax.transAxes,
+                    ha='center', va='center', color='gray')
+            return
+
+        all_vals = np.concatenate(all_chunks)
+        x_margin = max((all_vals.max() - all_vals.min()) * 0.08, 1e-6)
+        x_range  = np.linspace(all_vals.min() - x_margin,
+                               all_vals.max() + x_margin, 400)
+        rng = np.random.default_rng(seed=0)
+
+        baselines: list[float] = []
+        n_skipped = 0
+        for i, (name, vals, color) in enumerate(zip(feat_names, plot_d, colors)):
+            baseline = float((n - 1 - i) * band_spacing)
+            baselines.append(baseline)
+            ax.axhline(baseline, color=color, linewidth=0.6, alpha=0.35, zorder=1)
+
+            if len(vals) < 2:
+                n_skipped += 1
+                continue
+
+            kde = gaussian_kde(vals, bw_method='scott')
+            ky  = kde(x_range)
+            ky  = ky / ky.max() * kde_height
+            ax.fill_between(x_range, baseline, baseline + ky,
+                            color=color, alpha=0.45, zorder=2)
+            ax.plot(x_range, baseline + ky,
+                    color=color, linewidth=1.4, alpha=0.9, zorder=3)
+
+            if show_points:
+                jitter = rng.uniform(-cloud_height, 0.0, len(vals))
+                ax.scatter(vals, baseline + jitter,
+                           s=4, alpha=0.45, color=color,
+                           linewidths=0, zorder=4)
+
+        ax.set_yticks(baselines)
+        ax.set_yticklabels(feat_names, fontsize=9)
+        ax.tick_params(axis='y', length=0)
+        ax.set_ylim(-cloud_height - 0.15,
+                    (n - 1) * band_spacing + kde_height + 0.15)
+        ax.set_xlabel(_lbl(ridge_metric), fontsize=11)
+        ax.set_title(f'Distribution of {_lbl(ridge_metric)} by band', fontsize=11)
+        ax.xaxis.grid(True, linestyle='--', alpha=0.4)
+        ax.set_axisbelow(True)
+        for spine in ('left', 'right', 'top'):
+            ax.spines[spine].set_visible(False)
+
+        if n_skipped:
+            ax.text(0.99, 0.99, f'{n_skipped} band(s) skipped (< 2 spectra)',
+                    transform=ax.transAxes, ha='right', va='top',
+                    fontsize=8, color='gray')
+
+    # ── Compose figure ────────────────────────────────────────────────────────
+    if kind == 'both':
+        fig, (ax_sc, ax_rd) = plt.subplots(1, 2, figsize=(15, 6))
+        _plot_scatter(ax_sc)
+        _plot_ridge(ax_rd)
+        fig.tight_layout(rect=[0, 0, 1, 1])
+    elif kind == 'scatter':
+        fig, ax_sc = plt.subplots(figsize=(8, 6))
+        _plot_scatter(ax_sc)
+        fig.tight_layout()
+    elif kind == 'ridge':
+        n_feats = len(feat_list)
+        fig_h   = max(5.0, 0.55 * n_feats + 1.5)
+        fig, ax_rd = plt.subplots(figsize=(8, fig_h))
+        fig.subplots_adjust(left=0.28, right=0.97, top=0.93, bottom=0.08)
+        _plot_ridge(ax_rd)
+    else:
+        raise ValueError(
+            f"kind must be 'scatter', 'ridge', or 'both', got '{kind!r}'"
+        )
+
+    if save_path is not None:
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        logging.info("Saved %s", save_path)
+    if show:
+        plt.show()
+        return None
+    return fig
 
 
 # =============================================================================

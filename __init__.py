@@ -29,6 +29,16 @@ from .functions import (
     save_instrument_grids,
     load_instrument_grids,
     INSTRUMENT_PRESETS,
+    # single-spectrum VSWIR primitives
+    remove_continuum,
+    band_parameters,
+    smooth_spectrum,
+    detect_bands,
+    # batch VSWIR processing
+    smooth_spectra,
+    remove_continuum_batch,
+    band_parameters_batch,
+    detect_bands_batch,
 )
 from .utils import (
     bbt,
@@ -50,6 +60,7 @@ from .utils import (
     readEmissionTXTnotes,
     readEmissionCSVnotes,
     readOMNIC,
+    load_reflectance_vswir,
     loadReflectanceCSV,
     saveReflectanceCSV,
     loadASD,
@@ -60,8 +71,10 @@ from .utils import (
     save_sma_csv,
     printStructInfo,
     recursiveHDFreader,
+    save_band_parameters_csv,
+    load_band_parameters_csv,
 )
 from . import plot
 from .config import configure, get_config
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

@@ -589,7 +589,7 @@ def convert_crism_speclib(
                 'specimen_name':       specimen_name,
                 'specimen_id':         specimen_id,
                 'crism_id':            crism_id,
-                'type':                spec_type,
+                'spectral_range':      spec_type,
                 'reference':           reference,
                 'current_location':    cur_loc,
                 'collection_location': col_loc,

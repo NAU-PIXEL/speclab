@@ -26,6 +26,8 @@ saveDVhdf               Save a nested dict to a DV-format HDF5 file.
 _normalize_hdf_group    Normalise spectral axis layout in a loaded dict.
 readDVhdf               High-level wrapper: load + normalise a DV HDF5 file.
 dv_to_album             Convert any readDVhdf output to a sequential-int album dict.
+save_band_parameters_csv / load_band_parameters_csv
+                        Round-trippable CSV I/O for band_parameters_batch() output.
 """
 from collections.abc import Iterator
 
@@ -1515,6 +1517,63 @@ def saveReflectanceCSV(
     pd.DataFrame({'Wavelength': xaxis, **spectra}).to_csv(path, index=False)
 
 
+def load_reflectance_vswir(
+    path: 'str | Path',
+    *,
+    fmt: str = 'auto',
+) -> dict:
+    """
+    Load a VSWIR reflectance file and return a data dict.
+
+    Thin convenience wrapper around :func:`loadReflectanceCSV` and
+    :func:`loadASD` that converts the resulting DataFrame directly to numpy
+    arrays, so callers never need to handle the intermediate DataFrame.
+
+    Parameters
+    ----------
+    path : str or Path
+        Path to the reflectance file.
+    fmt : {'auto', 'csv', 'asd'}
+        File format.  ``'auto'`` infers from the file extension: ``.txt``
+        is treated as an ASD export, everything else as CSV.
+
+    Returns
+    -------
+    dict
+        ``'xaxis'``  : np.ndarray, shape (n_channels,) — wavelength axis in nm.
+        ``'spectra'``: dict[str, np.ndarray] — spectrum name → 1-D array.
+        ``'source'`` : Path — resolved file path.
+
+    Raises
+    ------
+    ValueError
+        Propagated from :func:`loadReflectanceCSV` / :func:`loadASD` on
+        missing wavelength column or non-numeric spectrum columns.
+    """
+    from pathlib import Path as _Path
+    path = _Path(path)
+
+    if fmt == 'auto':
+        fmt = 'asd' if path.suffix.lower() == '.txt' else 'csv'
+
+    df = loadASD(path) if fmt == 'asd' else loadReflectanceCSV(path)
+
+    wl_col = next(c for c in df.columns if c.strip().lower() in _WL_COLUMN_NAMES)
+    xaxis  = df[wl_col].to_numpy(dtype=np.float64)
+    spectra: dict[str, np.ndarray] = {}
+    for col in df.columns:
+        if col == wl_col:
+            continue
+        try:
+            spectra[col] = df[col].to_numpy(dtype=np.float64)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(
+                f"Column '{col}' in '{path.name}' contains non-numeric data."
+            ) from exc
+
+    return {'xaxis': xaxis, 'spectra': spectra, 'source': path}
+
+
 def loadASD(path: 'str | Path') -> pd.DataFrame:
     """
     Parse an ASD spectrometer tab-separated text export into a DataFrame.
@@ -1812,3 +1871,324 @@ def save_refcal_csv(out: dict, fname: str) -> None:
     df = pd.DataFrame(cols, index=wn)
     df.index.name = 'wavenumber_cm-1'
     df.to_csv(fname)
+
+
+# =============================================================================
+# Band parameters CSV I/O
+# =============================================================================
+
+# Canonical metric key order — matches functions.band_parameters() return dict.
+_BP_METRIC_KEYS: list[str] = [
+    'wl_center', 'wl_min', 'band_depth', 'fwhm', 'base_width',
+    'band_area', 'band_area_ratio', 'asymmetry_hw', 'asymmetry_centroid',
+]
+# Wavelength-valued metrics that must be scaled when unit != 'nm'.
+_BP_METRIC_SCALED: frozenset[str] = frozenset({
+    'wl_center', 'wl_min', 'fwhm', 'base_width', 'band_area',
+})
+
+# Magic string that identifies the new CSV format.
+_BP_MAGIC       = '# speclab:band_parameters'
+_BP_UNIT_PREFIX = '# unit: '
+_BP_FEAT_PREFIX = '# features: '
+
+# Column-suffix → (metric_key, unit_hint) for the *old* GUI export format.
+# Sorted longest-first so the matching loop picks the most specific suffix.
+_BP_OLD_SUFFIXES: list[tuple[str, str, 'str | None']] = sorted([
+    ('Band center (nm)',  'wl_center',          'nm'),
+    ('Band center (µm)', 'wl_center',          'µm'),
+    ('Band min (nm)',     'wl_min',             'nm'),
+    ('Band min (µm)',    'wl_min',             'µm'),
+    ('Depth',             'band_depth',         None),
+    ('FWHM (nm)',         'fwhm',               'nm'),
+    ('FWHM (µm)',        'fwhm',               'µm'),
+    ('Base width (nm)',   'base_width',         'nm'),
+    ('Base width (µm)',  'base_width',         'µm'),
+    ('Band area (nm)',    'band_area',          'nm'),
+    ('Band area (µm)',   'band_area',          'µm'),
+    ('Area ratio',        'band_area_ratio',    None),
+    ('Asym HW',           'asymmetry_hw',       None),
+    ('Asym centroid',     'asymmetry_centroid', None),
+], key=lambda x: -len(x[0]))
+
+
+def save_band_parameters_csv(
+    out:  dict,
+    path: 'str | Path',
+    unit: str = 'nm',
+) -> None:
+    """
+    Save band-parameter results to a round-trippable CSV file.
+
+    The file begins with three comment rows that store the file format
+    identifier, the wavelength unit, and a JSON-encoded feature list (name,
+    shoulder window, group).  The data section uses
+    ``{feature_name}::{metric_key}`` column names so the file can be loaded
+    back without ambiguity.
+
+    Parameters
+    ----------
+    out : dict
+        Output dict from :func:`~functions.band_parameters_batch`.  Required
+        keys: ``'features'`` (list of feature dicts) and ``'results'``
+        (mapping spectrum name → feature name → band-parameter dict or
+        ``None``).  Optional key: ``'sources'`` (mapping spectrum name →
+        ``'Data'`` or ``'Library'``).
+    path : str or Path
+        Destination CSV file path.
+    unit : str
+        Wavelength unit for saved values.  ``'nm'`` (default) writes raw
+        nanometre values; ``'µm'`` divides all wavelength-valued metrics by
+        1000.
+
+    Notes
+    -----
+    ``None`` band-parameter results (features absent from a spectrum) are
+    written as empty cells.  ``band_depth`` is used as the presence
+    discriminator on load: an empty ``band_depth`` cell means ``None``.
+    """
+    import json
+    import csv
+    from pathlib import Path as _Path
+
+    path = _Path(path)
+    if unit not in ('nm', 'µm'):
+        raise ValueError(f"unit must be 'nm' or 'µm', got {unit!r}")
+
+    feat_list: list[dict] = out['features']
+    res_dict:  dict       = out['results']
+    sources:   dict       = out.get('sources', {})
+    scale = 1e-3 if unit == 'µm' else 1.0
+
+    feat_meta: list[dict] = []
+    for feat in feat_list:
+        wr = feat.get('wl_range')
+        feat_meta.append({
+            'name':  feat['name'],
+            'wl_lo': float(wr[0]) if wr else None,
+            'wl_hi': float(wr[1]) if wr else None,
+            'group': feat.get('group', ''),
+        })
+
+    with open(path, 'w', newline='', encoding='utf-8') as fh:
+        fh.write(_BP_MAGIC + '\n')
+        fh.write(_BP_UNIT_PREFIX + unit + '\n')
+        fh.write(_BP_FEAT_PREFIX + json.dumps(feat_meta, ensure_ascii=False) + '\n')
+
+        writer = csv.writer(fh)
+        header = (['Spectrum', 'Source']
+                  + [f'{feat["name"]}::{key}'
+                     for feat in feat_list
+                     for key  in _BP_METRIC_KEYS])
+        writer.writerow(header)
+
+        for sp_name, feat_results in res_dict.items():
+            row: list = [sp_name, sources.get(sp_name, '')]
+            for feat in feat_list:
+                bp = feat_results.get(feat['name'])
+                if bp is None:
+                    row += [''] * len(_BP_METRIC_KEYS)
+                else:
+                    for key in _BP_METRIC_KEYS:
+                        val = bp.get(key)
+                        if val is None or (isinstance(val, float) and np.isnan(val)):
+                            row.append('')
+                        else:
+                            row.append(val * scale if key in _BP_METRIC_SCALED else val)
+            writer.writerow(row)
+
+
+def load_band_parameters_csv(
+    path: 'str | Path',
+) -> dict:
+    """
+    Load band-parameter results from a CSV written by
+    :func:`save_band_parameters_csv` or exported from the ReflectanceVSWIR GUI.
+
+    Detects the format automatically:
+
+    * **New format** — file begins with ``# speclab:band_parameters``:
+      unit, feature shoulder windows, and groups are fully recovered.
+    * **Old GUI export format** — plain header with columns such as
+      ``"1400 nm H2O Band center (nm)"``: feature names and metric keys are
+      inferred by suffix-matching; ``wl_range`` and ``group`` are set to
+      ``None`` / ``''``.
+
+    Parameters
+    ----------
+    path : str or Path
+        Path to the CSV file.
+
+    Returns
+    -------
+    dict
+        Keys:
+
+        ``'features'``
+            ``list[dict]`` — each with ``'name'``, ``'wl_range'`` (``None``
+            for old-format files), ``'group'``.
+        ``'results'``
+            ``dict[str, dict[str, dict | None]]`` — spectrum name →
+            feature name → :func:`~functions.band_parameters` result or
+            ``None``.  All wavelength-valued metrics are in **nm**.
+        ``'sources'``
+            ``dict[str, str]`` — spectrum name → ``'Data'``,
+            ``'Library'``, or ``''``.
+    """
+    from pathlib import Path as _Path
+    path = _Path(path)
+    with open(path, encoding='utf-8') as fh:
+        first = fh.readline().rstrip('\n')
+    if first == _BP_MAGIC:
+        return _load_bp_csv_new(path)
+    return _load_bp_csv_old(path)
+
+
+def _load_bp_csv_new(path: 'Path') -> dict:
+    """Parse the ``# speclab:band_parameters`` format."""
+    import json
+    import csv
+
+    unit      = 'nm'
+    feat_meta: list[dict] = []
+
+    with open(path, encoding='utf-8') as fh:
+        for i, line in enumerate(fh):
+            line = line.rstrip('\n')
+            if i == 1 and line.startswith(_BP_UNIT_PREFIX):
+                unit = line[len(_BP_UNIT_PREFIX):]
+            elif i == 2 and line.startswith(_BP_FEAT_PREFIX):
+                feat_meta = json.loads(line[len(_BP_FEAT_PREFIX):])
+            elif i >= 3:
+                break
+
+    # Values in the file are in `unit`; undo scaling to recover nm.
+    scale = 1e-3 if unit == 'µm' else 1.0
+
+    features: list[dict] = []
+    for fm in feat_meta:
+        wl_lo, wl_hi = fm.get('wl_lo'), fm.get('wl_hi')
+        features.append({
+            'name':     fm['name'],
+            'wl_range': (float(wl_lo), float(wl_hi))
+                        if (wl_lo is not None and wl_hi is not None) else None,
+            'group':    fm.get('group', ''),
+        })
+    feat_names = [f['name'] for f in features]
+
+    with open(path, encoding='utf-8') as fh:
+        for _ in range(3):      # skip the 3 comment rows
+            next(fh)
+        reader = csv.DictReader(fh)
+        rows   = list(reader)
+
+    results: dict[str, 'dict[str, dict | None]'] = {}
+    sources: dict[str, str]                      = {}
+
+    for row in rows:
+        sp_name          = row['Spectrum']
+        sources[sp_name] = row.get('Source', '')
+        feat_results: dict[str, 'dict | None'] = {}
+
+        for feat_name in feat_names:
+            # band_depth is never NaN in a valid result — use it as sentinel.
+            if row.get(f'{feat_name}::band_depth', '') == '':
+                feat_results[feat_name] = None
+            else:
+                bp: dict[str, float] = {}
+                for key in _BP_METRIC_KEYS:
+                    val_str = row.get(f'{feat_name}::{key}', '')
+                    if val_str == '':
+                        bp[key] = float('nan')
+                    else:
+                        raw = float(val_str)
+                        bp[key] = raw / scale if key in _BP_METRIC_SCALED else raw
+                feat_results[feat_name] = bp
+
+        results[sp_name] = feat_results
+
+    return {'features': features, 'results': results, 'sources': sources}
+
+
+def _load_bp_csv_old(path: 'Path') -> dict:
+    """
+    Parse the old ReflectanceVSWIR GUI export format (best-effort).
+
+    Column names are ``"{feature_name} {metric_display_label}"``.  Feature
+    names are recovered by stripping the longest matching known metric suffix.
+    ``wl_range`` and ``group`` cannot be recovered and are set to ``None``
+    and ``''``.
+    """
+    import csv
+
+    with open(path, encoding='utf-8') as fh:
+        reader     = csv.DictReader(fh)
+        rows       = list(reader)
+        fieldnames = reader.fieldnames or []
+
+    data_cols = [c for c in fieldnames if c not in ('Spectrum', 'Source')]
+    if not data_cols:
+        raise ValueError(
+            f"'{path.name}' has no recognised data columns — expected the old "
+            "ReflectanceVSWIR export format or the speclab:band_parameters format."
+        )
+
+    detected_unit: 'str | None' = None
+    col_map: list[tuple[str, str]] = []    # (feat_name, metric_key) per column
+
+    for col in data_cols:
+        for suffix, metric_key, col_unit in _BP_OLD_SUFFIXES:
+            if col.endswith(f' {suffix}'):
+                col_map.append((col[: -(len(suffix) + 1)], metric_key))
+                if col_unit is not None and detected_unit is None:
+                    detected_unit = col_unit
+                break
+        else:
+            raise ValueError(
+                f"Column '{col}' in '{path.name}' does not match any known "
+                "band-parameter metric label; the file may use an unsupported format."
+            )
+
+    unit  = detected_unit or 'nm'
+    scale = 1e-3 if unit == 'µm' else 1.0
+
+    seen: dict[str, None] = {}
+    for feat_name, _ in col_map:
+        seen[feat_name] = None
+    feat_names = list(seen.keys())
+
+    features: list[dict] = [
+        {'name': fn, 'wl_range': None, 'group': ''}
+        for fn in feat_names
+    ]
+
+    results: dict[str, 'dict[str, dict | None]'] = {}
+    sources: dict[str, str]                      = {}
+
+    for row in rows:
+        sp_name          = row.get('Spectrum', '')
+        sources[sp_name] = row.get('Source', '')
+        feat_bp: dict[str, dict] = {fn: {} for fn in feat_names}
+
+        for col, (feat_name, metric_key) in zip(data_cols, col_map):
+            val_str = row.get(col, '')
+            if val_str == '':
+                feat_bp[feat_name][metric_key] = float('nan')
+            else:
+                raw = float(val_str)
+                feat_bp[feat_name][metric_key] = (
+                    raw / scale if metric_key in _BP_METRIC_SCALED else raw
+                )
+
+        feat_results: dict[str, 'dict | None'] = {}
+        for fn in feat_names:
+            bp = feat_bp[fn]
+            if np.isnan(bp.get('band_depth', float('nan'))):
+                feat_results[fn] = None
+            else:
+                for key in _BP_METRIC_KEYS:
+                    bp.setdefault(key, float('nan'))
+                feat_results[fn] = bp
+        results[sp_name] = feat_results
+
+    return {'features': features, 'results': results, 'sources': sources}

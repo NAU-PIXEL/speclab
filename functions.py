@@ -489,6 +489,294 @@ def detect_bands(
 
 
 # =============================================================================
+# ==================== batch VSWIR processing =================================
+# =============================================================================
+
+def smooth_spectra(
+    data: dict,
+    method: str = 'savgol',
+    *,
+    window_nm:  float = 30.0,
+    poly_order: int   = 3,
+) -> dict:
+    """
+    Apply spectral smoothing to every spectrum in a data dict.
+
+    A thin batch wrapper around :func:`smooth_spectrum`.  All spectra in
+    ``data['spectra']`` must share the common ``data['xaxis']`` axis (which is
+    the contract established by :func:`~speclab.utils.load_reflectance_vswir`).
+
+    Parameters
+    ----------
+    data : dict
+        Dict with at minimum keys ``'xaxis'`` (shape ``(n_channels,)``) and
+        ``'spectra'`` (``dict[str, np.ndarray]``, each 1-D, shape
+        ``(n_channels,)``).  Any extra keys are forwarded to the output.
+    method : str
+        Smoothing algorithm passed to :func:`smooth_spectrum`.
+        One of ``'savgol'`` (default), ``'moving_avg'``, ``'moving_median'``,
+        ``'gaussian'``.
+    window_nm : float
+        Smoothing scale in nanometres (default 30).
+    poly_order : int
+        Savitzky-Golay polynomial order (default 3, ignored by other methods).
+
+    Returns
+    -------
+    dict
+        Copy of *data* with ``'spectra'`` replaced by smoothed arrays and
+        ``'smooth_params'`` added::
+
+            {
+                'xaxis':        np.ndarray,
+                'spectra':      dict[str, np.ndarray],   # smoothed
+                'smooth_params': {'method': str, 'window_nm': float,
+                                  'poly_order': int},
+                ...                                       # forwarded keys
+            }
+    """
+    xaxis = data['xaxis']
+    smoothed_spectra: dict[str, np.ndarray] = {
+        name: smooth_spectrum(xaxis, arr, method,
+                              window_nm=window_nm, poly_order=poly_order)
+        for name, arr in data['spectra'].items()
+    }
+    return {
+        **data,
+        'spectra':       smoothed_spectra,
+        'smooth_params': {
+            'method':     method,
+            'window_nm':  window_nm,
+            'poly_order': poly_order,
+        },
+    }
+
+
+def remove_continuum_batch(
+    data:     dict,
+    wl_range: tuple[float, float] | None = None,
+) -> dict:
+    """
+    Apply convex-hull continuum removal to every spectrum in a data dict.
+
+    A thin batch wrapper around :func:`remove_continuum`.  Returns continuum-
+    removed (CR) reflectance where 1.0 means "on the continuum" and values
+    below 1.0 indicate absorption depth relative to the local baseline.
+
+    Parameters
+    ----------
+    data : dict
+        Dict with ``'xaxis'`` and ``'spectra'`` (see :func:`smooth_spectra`).
+    wl_range : tuple[float, float] or None
+        ``(wl_lo, wl_hi)`` shoulder window for the hull computation (nm).
+        Channels outside this range are set to 1.0.  ``None`` uses the full
+        spectrum.
+
+    Returns
+    -------
+    dict
+        Copy of *data* with ``'spectra'`` replaced by CR arrays and
+        ``'cr_params'`` added::
+
+            {
+                'xaxis':     np.ndarray,
+                'spectra':   dict[str, np.ndarray],  # continuum-removed
+                'cr_params': {'wl_range': tuple or None},
+                ...
+            }
+    """
+    xaxis = data['xaxis']
+    cr_spectra: dict[str, np.ndarray] = {
+        name: remove_continuum(xaxis, arr, wl_range=wl_range)
+        for name, arr in data['spectra'].items()
+    }
+    return {
+        **data,
+        'spectra':   cr_spectra,
+        'cr_params': {'wl_range': wl_range},
+    }
+
+
+def band_parameters_batch(
+    data:     dict,
+    features: list[dict],
+) -> dict:
+    """
+    Compute band parameters for a list of features on every spectrum in a data dict.
+
+    Runs :func:`band_parameters` for each (spectrum, feature) pair.  Features
+    absent from a spectrum (too few channels, no detectable absorption) produce
+    a ``None`` entry rather than raising.
+
+    Parameters
+    ----------
+    data : dict
+        Dict with ``'xaxis'`` and ``'spectra'`` (see :func:`smooth_spectra`).
+        Pass continuum-removed data (from :func:`remove_continuum_batch`) for
+        more precise parameter estimates, or smoothed data (from
+        :func:`smooth_spectra`) for noise reduction.
+    features : list[dict]
+        Feature descriptors.  Each dict must have at minimum:
+
+        ``'name'``
+            Unique string identifier (used as the key in the results).
+        ``'wl_range'``
+            ``(wl_lo, wl_hi)`` shoulder window passed to
+            :func:`band_parameters`.
+
+        Additional keys (``'group'``, ``'wavelength'``, ``'fwhm'``, …) are
+        carried through unchanged into ``results['features']``.
+
+    Returns
+    -------
+    dict
+        Keys::
+
+            {
+                'xaxis':    np.ndarray,
+                'features': list[dict],               # input feature list
+                'results':  dict[str, dict[str, dict | None]],
+            }
+
+        ``results[spectrum_name][feature_name]`` is either the dict returned
+        by :func:`band_parameters` (keys: ``wl_center``, ``wl_min``,
+        ``band_depth``, ``fwhm``, ``base_width``, ``band_area``,
+        ``band_area_ratio``, ``asymmetry_hw``, ``asymmetry_centroid``) or
+        ``None`` when the feature is absent.
+    """
+    xaxis = data['xaxis']
+    results: dict[str, dict[str, dict | None]] = {}
+    for name, arr in data['spectra'].items():
+        feat_results: dict[str, dict | None] = {}
+        for feat in features:
+            feat_results[feat['name']] = band_parameters(
+                xaxis, arr, wl_range=feat['wl_range'])
+        results[name] = feat_results
+    return {
+        'xaxis':    xaxis,
+        'features': features,
+        'results':  results,
+    }
+
+
+def detect_bands_batch(
+    data:    dict,
+    presets: list[dict] | None = None,
+    *,
+    wl_range:           tuple[float, float] | None = None,
+    smooth_method:      str   = 'savgol',
+    smooth_window_nm:   float = 30.0,
+    smooth_polyorder:   int   = 3,
+    min_prominence:     float = 0.02,
+    min_width_nm:       float = 15.0,
+    min_depth:          float = 0.01,
+    match_tolerance_nm: float = 30.0,
+) -> dict:
+    """
+    Detect absorption features in every spectrum of a data dict and merge
+    candidates across spectra.
+
+    Runs :func:`detect_bands` on each spectrum, then merges per-spectrum
+    candidate lists into a single cross-spectrum list: the first occurrence's
+    parameters are kept and successive matching detections only append the
+    spectrum name to ``'seen_in'``.
+
+    Parameters
+    ----------
+    data : dict
+        Dict with ``'xaxis'`` and ``'spectra'`` (see :func:`smooth_spectra`).
+    presets : list[dict] or None
+        Known feature descriptors used for name-matching (keys: ``'name'``,
+        ``'wavelength'``, ``'fwhm'``, ``'wl_range'``).  ``None`` skips
+        matching.
+    wl_range : tuple[float, float] or None
+        Restrict detection to this wavelength window (nm).  Channels outside
+        are excluded before passing to :func:`detect_bands`.  Useful for
+        suppressing MIR bands when analysing VSWIR data that extends beyond
+        2500 nm.
+    smooth_method : str
+        Smoothing algorithm (see :func:`smooth_spectrum`).
+    smooth_window_nm : float
+        Smoothing window in nm (default 30).
+    smooth_polyorder : int
+        Savitzky-Golay polynomial order (default 3).
+    min_prominence : float
+        Minimum peak prominence in reflectance units [0–1].
+    min_width_nm : float
+        Minimum peak width in nm.
+    min_depth : float
+        Minimum band depth after continuum removal to retain a candidate.
+    match_tolerance_nm : float
+        Two candidates from different spectra are merged when their ``wl_min``
+        values differ by less than this value (nm).  Also used as the preset-
+        matching tolerance inside :func:`detect_bands`.
+
+    Returns
+    -------
+    dict
+        Keys::
+
+            {
+                'per_spectrum': dict[str, list[dict]],  # raw per-spectrum results
+                'merged':       list[dict],              # cross-spectrum merged list
+                'params':       dict,                    # all detection settings
+            }
+
+        Each entry in ``'merged'`` contains all keys from
+        :func:`band_parameters` plus ``'wl_range'``, ``'matched_name'``,
+        ``'matched_preset'``, and ``'seen_in'`` (list of spectrum names).
+    """
+    xaxis = data['xaxis']
+    if wl_range is not None:
+        mask  = (xaxis >= wl_range[0]) & (xaxis <= wl_range[1])
+        x_sub = xaxis[mask]
+    else:
+        mask  = np.ones(len(xaxis), dtype=bool)
+        x_sub = xaxis
+
+    per_spectrum: dict[str, list[dict]] = {}
+    merged: list[dict] = []
+    for name, arr in data['spectra'].items():
+        candidates = detect_bands(
+            x_sub, arr[mask], presets,
+            smooth_method=smooth_method,
+            smooth_window_nm=smooth_window_nm,
+            smooth_polyorder=smooth_polyorder,
+            min_prominence=min_prominence,
+            min_width_nm=min_width_nm,
+            min_depth=min_depth,
+            match_tolerance_nm=match_tolerance_nm,
+        )
+        per_spectrum[name] = candidates
+        for cand in candidates:
+            existing = next(
+                (m for m in merged
+                 if abs(cand['wl_min'] - m['wl_min']) < match_tolerance_nm),
+                None,
+            )
+            if existing is not None:
+                existing['seen_in'].append(name)
+            else:
+                merged.append({**cand, 'seen_in': [name]})
+
+    merged.sort(key=lambda c: c['wl_min'])
+    return {
+        'per_spectrum': per_spectrum,
+        'merged':       merged,
+        'params': {
+            'wl_range':           wl_range,
+            'smooth_method':      smooth_method,
+            'smooth_window_nm':   smooth_window_nm,
+            'smooth_polyorder':   smooth_polyorder,
+            'min_prominence':     min_prominence,
+            'min_width_nm':       min_width_nm,
+            'min_depth':          min_depth,
+            'match_tolerance_nm': match_tolerance_nm,
+        },
+    }
+
+
+# =============================================================================
 # ============================== load_sbm =====================================
 # =============================================================================
 
