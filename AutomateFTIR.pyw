@@ -59,7 +59,7 @@ if __package__ is None:
     __package__ = 'speclab'
 
 from .plot import _add_top_axis
-from .utils import readOMNIC, normalize, r2t_nau, c2k
+from .utils import readOMNIC, normalize, r2t_nau, c2k, _set_window_size
 from .functions import emcal, tracal, refcal, MissingTempsError
 from . import __version__
 
@@ -1158,8 +1158,8 @@ class AutomateFTIR(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(f'AutomateFTIR v{__version__}')
-        self.state('zoomed')   # maximised on Windows
-        self.minsize(1000, 640)
+        _set_window_size(self, fullscreen=True, min_w=1000, min_h=640)
+        self._sw = self.winfo_screenwidth()
 
         # ── Save directory ────────────────────────────────────────────────
         self._save_fdir: Path | None = None
@@ -1613,7 +1613,7 @@ class AutomateFTIR(tk.Tk):
     # ── Right panel ──────────────────────────────────────────────────────────
 
     def _build_right_panel(self, parent: ttk.PanedWindow) -> None:
-        right = ttk.Frame(parent, width=380)
+        right = ttk.Frame(parent, width=int(self._sw * 0.20))
         right.pack_propagate(False)
         parent.add(right, weight=0)
 

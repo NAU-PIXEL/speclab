@@ -51,11 +51,28 @@ Ports and extends algorithms from the DaVinci spectroscopy environment.
 
 ## Installation
 
+### Using conda / mamba (recommended)
+
 ```bash
+conda create -n speclab python=3.11
+conda activate speclab
 pip install -e .
 ```
 
-For the `AutomateFTIR` GUI on Windows, additional hardware drivers are required:
+### Using venv
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -e .
+```
+
+Both approaches install all core dependencies listed in `pyproject.toml` and
+make the `speclib-viewer`, `emission-processor`, and `reflectance-vswir`
+entry-point commands available inside the environment.
+
+For the `AutomateFTIR` GUI on Windows, install additional hardware drivers
+after activating the environment:
 
 ```bash
 pip install pyvisa pywin32

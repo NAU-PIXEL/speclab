@@ -21,7 +21,7 @@ import matplotlib
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 
-from speclab.utils import readDVhdf
+from speclab.utils import readHDF
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -43,7 +43,7 @@ EMCAL_PATH = Path(os.path.expanduser('~/Library/CloudStorage')) / _nc / \
 # ---------------------------------------------------------------------------
 
 print(f'Loading CSE library: {CSE_PATH.name}')
-cse = readDVhdf(str(CSE_PATH))
+cse = readHDF(str(CSE_PATH))
 cse_names   = [str(n).strip() for n in cse['sample_name']]
 cse_data    = cse['data']       # (100, 936)
 cse_xaxis   = cse['xaxis']     # (936,)

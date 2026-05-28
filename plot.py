@@ -333,7 +333,7 @@ def plot_speclib(
     ----------
     out : dict
         Album dict ``{spec_id: {'data', 'xaxis', 'sample_name', ...}}``
-        as returned by :func:`~utils.readDVhdf` / ``_load_hdf``, or a
+        as returned by :func:`~utils.readHDF` / ``_load_hdf``, or a
         flat dict with shared ``'xaxis'``, ``'data'``, and ``'spec_id'``
         keys.
     resample : str

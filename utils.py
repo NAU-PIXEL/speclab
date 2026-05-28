@@ -21,11 +21,8 @@ readEmissionCSVnotes    Load CSV/XLS emission measurement notes.
 readOMNIC               Read a two-column OMNIC CSV spectrum file.
 printStructInfo         Recursively print a nested dict structure.
 find_key_recursively    Yield all values for a key in a nested dict.
-recursiveHDFreader      Load an HDF5 file into a nested dict.
-saveDVhdf               Save a nested dict to a DV-format HDF5 file.
-_normalize_hdf_group    Normalise spectral axis layout in a loaded dict.
-readDVhdf               High-level wrapper: load + normalise a DV HDF5 file.
-dv_to_album             Convert any readDVhdf output to a sequential-int album dict.
+saveHDF                 Save a nested dict to an HDF5 file.
+readHDF                 High-level wrapper: load + normalise an HDF5 file (DaVinci-compatible).
 save_band_parameters_csv / load_band_parameters_csv
                         Round-trippable CSV I/O for band_parameters_batch() output.
 """
@@ -789,7 +786,7 @@ def find_key_recursively(key_to_find: str, dictionary: dict | list) -> Iterator:
             yield from find_key_recursively(key_to_find, item)
 
 
-def recursiveHDFreader(h5_object: h5py.File, path: str = '/') -> dict:
+def _read_hdf_raw(h5_object: h5py.File, path: str = '/') -> dict:
     """
     Recursively load all datasets and groups from an HDF5 object into a dict.
 
@@ -898,18 +895,17 @@ def recursiveHDFreader(h5_object: h5py.File, path: str = '/') -> dict:
             data_dict[key] = val
 
         elif isinstance(item, h5py.Group):
-            data_dict[key] = recursiveHDFreader(h5_object, path + key + '/')
+            data_dict[key] = _read_hdf_raw(h5_object, path + key + '/')
 
     return data_dict
 
 
-def saveDVhdf(data: dict, fname: str) -> None:
+def saveHDF(data: dict, fname: str) -> None:
     """
-    Save a nested dict to an HDF5 file in DV format, readable by readDVhdf.
+    Save a nested dict to an HDF5 file, readable by :func:`readHDF`.
 
     Dicts are written as HDF5 groups, numpy arrays as datasets, scalars as
-    0-d datasets, and strings as byte-encoded datasets.  The structure mirrors
-    what ``readDVhdf`` / ``recursiveHDFreader`` expects to load back.
+    0-d datasets, and strings as byte-encoded datasets.
 
     Parameters
     ----------
@@ -943,14 +939,14 @@ def saveDVhdf(data: dict, fname: str) -> None:
                         h5_group.create_dataset(skey, data=np.array(val))
                     except TypeError:
                         logging.warning(
-                            "saveDVhdf: skipping key '%s' (list with unsupported element type %s)",
+                            "saveHDF: skipping key '%s' (list with unsupported element type %s)",
                             skey, type(val[0]) if val else 'empty',
                         )
             else:
                 try:
                     h5_group.create_dataset(skey, data=np.array(val))
                 except TypeError:
-                    logging.warning("saveDVhdf: skipping key '%s' (unsupported type %s)", skey, type(val))
+                    logging.warning("saveHDF: skipping key '%s' (unsupported type %s)", skey, type(val))
 
     with h5py.File(fname, 'w') as f:
         _write_group(f, data)
@@ -1176,7 +1172,7 @@ def _detect_hdf_format(fname: str) -> str:
                              (DaVinci native or makeASUspeclib grouped format).
         ``'per_spectrum'`` – top-level keys are all numeric strings and each is
                              a group containing ``data`` + ``xaxis``
-                             (SpeclibViewerTIR / saveDVhdf export format).
+                             (SpeclibViewerTIR / saveHDF export format).
     """
     with h5py.File(fname, 'r') as f:
         keys = list(f.keys())
@@ -1204,13 +1200,13 @@ def _collapse_per_spectrum(d: dict) -> dict:
 
     Raises ``ValueError`` if the per-spectrum xaxes are not all identical
     (checked with ``np.allclose``), since stacking spectra with mismatched grids
-    is undefined.  In that case, call ``readDVhdf`` with ``collapse=False`` to
+    is undefined.  In that case, call ``readHDF`` with ``collapse=False`` to
     receive the raw per-spectrum dict instead.
 
     Parameters
     ----------
     d : dict
-        Top-level dict from ``recursiveHDFreader`` for a per-spectrum file.
+        Top-level dict from ``_read_hdf_raw`` for a per-spectrum file.
 
     Returns
     -------
@@ -1229,10 +1225,10 @@ def _collapse_per_spectrum(d: dict) -> dict:
         ex = e['xaxis']
         if ex.shape != xaxis.shape or not np.allclose(ex, xaxis):
             raise ValueError(
-                f"readDVhdf: per-spectrum entry {spec_keys[i]} has a different "
+                f"readHDF: per-spectrum entry {spec_keys[i]} has a different "
                 f"xaxis (shape {ex.shape}) from entry {spec_keys[0]} "
                 f"(shape {xaxis.shape}). Cannot collapse to flat format. "
-                f"Call readDVhdf(..., collapse=False) to load as a per-spectrum dict."
+                f"Call readHDF(..., collapse=False) to load as a per-spectrum dict."
             )
 
     data = np.stack([e['data'] for e in entries], axis=0)   # (n_spectra, n_bands)
@@ -1256,7 +1252,7 @@ def _collapse_per_spectrum(d: dict) -> dict:
 
 def _normalize_hdf_group(d: dict) -> dict:
     """
-    Recursively normalise a dict returned by ``recursiveHDFreader``.
+    Recursively normalise a dict returned by ``_read_hdf_raw``.
 
     Two transformations are applied at every level that contains ``xaxis``:
 
@@ -1276,7 +1272,7 @@ def _normalize_hdf_group(d: dict) -> dict:
     Parameters
     ----------
     d : dict
-        One level of the nested dict from ``recursiveHDFreader``.
+        One level of the nested dict from ``_read_hdf_raw``.
 
     Returns
     -------
@@ -1313,7 +1309,7 @@ def _normalize_hdf_group(d: dict) -> dict:
                     d[key] = val
                 elif len(ix) > 1:
                     raise RuntimeError(
-                        f"readDVhdf: key '{key}' has more than one dimension "
+                        f"readHDF: key '{key}' has more than one dimension "
                         f"matching xaxis length {nx} — cannot determine spectral axis"
                     )
                 elif val.ndim > 1:
@@ -1331,14 +1327,14 @@ def _normalize_hdf_group(d: dict) -> dict:
     return d
 
 
-def readDVhdf(
+def readHDF(
     fname: str,
     path: str = '/',
     printout: bool = False,
     collapse: bool = True,
 ) -> dict:
     """
-    Open a DV-format HDF5 file and load its contents into a nested dict.
+    Open an HDF5 file and load its contents into a nested dict.
 
     Handles three on-disk formats transparently:
 
@@ -1346,7 +1342,7 @@ def readDVhdf(
       strings, ``data`` key holding spectra in ``(n_pts, n_spec)`` order.
     * **Grouped clean format** (``makeASUspeclib_dev``) – UTF-8 variable-length
       strings, ``spectra`` key, spectra in ``(n_spec, n_pts)`` order.
-    * **Per-spectrum format** (``saveDVhdf`` / SpeclibViewerTIR export) – one
+    * **Per-spectrum format** (:func:`saveHDF` / SpeclibViewer export) – one
       sub-group per spectrum keyed by a numeric string, ``data`` key shape
       ``(n_pts,)``.
 
@@ -1359,12 +1355,9 @@ def readDVhdf(
       ``{'1': {data, xaxis, …}, '2': {…}, …}`` so heterogeneous grids are
       preserved faithfully.
 
-    After loading, ``_normalize_hdf_group`` is applied recursively to every
-    group that contains an ``xaxis`` key:
-
-    * ``spectra`` is renamed to ``data``.
-    * Any array dimension equal to ``len(xaxis)`` is moved to the last
-      position so the spectral axis is always trailing.
+    After loading, spectral axes are normalised recursively: ``spectra`` keys
+    are renamed to ``data`` and any array dimension equal to ``len(xaxis)``
+    is moved to the last position so the spectral axis is always trailing.
 
     Parameters
     ----------
@@ -1389,18 +1382,16 @@ def readDVhdf(
     fmt = _detect_hdf_format(fname)
 
     with h5py.File(fname, 'r') as h5_object:
-        data_dict = recursiveHDFreader(h5_object, path)
+        data_dict = _read_hdf_raw(h5_object, path)
 
     if fmt == 'per_spectrum':
         if collapse:
             data_dict = _collapse_per_spectrum(data_dict)
-        # collapse=False: return the per-spectrum dict from recursiveHDFreader as-is
-        # (each sub-dict already normalised by the reader)
     else:
         data_dict = _normalize_hdf_group(data_dict)
 
     if printout:
-        print(f"DV structure with {len(data_dict.keys())} elements")
+        print(f"HDF structure with {len(data_dict.keys())} elements")
         printStructInfo(data_dict)
 
     return data_dict
@@ -1689,7 +1680,7 @@ def _unpack_string_field(val: np.ndarray, n_spec: int) -> list[str]:
     return [_decode(val.flat[0])] * n_spec
 
 
-def _flat_dv_to_album(raw: dict) -> dict:
+def _flat__to_album(raw: dict) -> dict:
     """
     Convert a flat DaVinci dict (one key per field, ``data`` is 2-D) to
     an album dict ``{i: {'data': ..., 'xaxis': ..., ...}}``.
@@ -1762,22 +1753,23 @@ def _per_spectrum_to_album(raw: dict) -> dict:
     return album
 
 
-def dv_to_album(raw: dict) -> dict:
+def _to_album(raw: dict) -> dict:
     """
-    Convert the output of :func:`readDVhdf` (any DV layout) to the album
-    dict ``{i: {'data': np.ndarray, 'xaxis': np.ndarray, ...}}`` expected
-    by :func:`~speclab.functions.sma` and SpectralViewer.
+    Convert the output of :func:`readHDF` to the per-spectrum album dict
+    ``{i: {'data': np.ndarray, 'xaxis': np.ndarray, ...}}`` expected by
+    :func:`~speclab.functions.sma` and SpeclibViewer.
 
-    Three layouts are handled automatically:
+    Intended for spectral library structures only — not general HDF outputs
+    (e.g. emcal results).  Three layouts are handled automatically:
 
-    * **Flat DaVinci** — top-level keys are field names; ``data`` is 2-D.
-    * **Grouped SV** — sub-dicts each hold a shared ``xaxis`` + 2-D ``data``.
-    * **Per-spectrum** — one sub-dict per spectrum (DV or SV format).
+    * **Flat** — top-level keys are field names; ``data`` is 2-D.
+    * **Grouped** — sub-dicts each hold a shared ``xaxis`` + 2-D ``data``.
+    * **Per-spectrum** — one sub-dict per spectrum.
 
     Parameters
     ----------
     raw : dict
-        Dict returned by :func:`readDVhdf`.
+        Dict returned by :func:`readHDF` for a spectral library file.
 
     Returns
     -------
@@ -1792,7 +1784,7 @@ def dv_to_album(raw: dict) -> dict:
     if 'xaxis' in raw and 'data' in raw and not isinstance(raw['data'], dict):
         data_val = raw['data']
         if isinstance(data_val, np.ndarray) and data_val.ndim >= 2:
-            return _flat_dv_to_album(raw)
+            return _flat__to_album(raw)
         return {0: {k: v for k, v in raw.items()}}
 
     if all(isinstance(v, dict) for v in raw.values()):
@@ -1802,7 +1794,7 @@ def dv_to_album(raw: dict) -> dict:
         return _per_spectrum_to_album(raw)
 
     raise ValueError(
-        "dv_to_album: unrecognised HDF5 layout — "
+        "_to_album: unrecognised spectral library layout — "
         f"top-level keys: {list(raw.keys())[:8]}"
     )
 
@@ -2108,6 +2100,61 @@ def _load_bp_csv_new(path: 'Path') -> dict:
         results[sp_name] = feat_results
 
     return {'features': features, 'results': results, 'sources': sources}
+
+
+# =============================================================================
+# GUI helpers
+# =============================================================================
+
+def _set_window_size(
+    root:       'tk.Wm',
+    fraction:   float = 0.85,
+    min_w:      int   = 1000,
+    min_h:      int   = 640,
+    fullscreen: bool  = False,
+) -> None:
+    """
+    Set the initial size and position of a tkinter top-level window.
+
+    When *fullscreen* is ``True`` the window is maximised using the best
+    available method for the current windowing system.  Otherwise the window
+    is sized to *fraction* of the screen in each dimension and centred.
+    *min_w* / *min_h* are always applied as the minimum resizable size.
+
+    Parameters
+    ----------
+    root : tk.Wm
+        Any tkinter top-level widget (``tk.Tk`` or ``tk.Toplevel``).
+    fraction : float
+        Fraction of screen width and height to use when not fullscreen
+        (default 0.85).
+    min_w : int
+        Minimum window width in pixels.
+    min_h : int
+        Minimum window height in pixels.
+    fullscreen : bool
+        Maximise the window to fill the screen (default False).
+    """
+    root.update_idletasks()
+    sw = root.winfo_screenwidth()
+    sh = root.winfo_screenheight()
+
+    if fullscreen:
+        ws = root.tk.call('tk', 'windowingsystem')
+        if ws == 'win32':
+            root.state('zoomed')
+        elif ws == 'aqua':              # macOS
+            root.geometry(f'{sw}x{sh}+0+0')
+        else:                           # X11 / Linux
+            root.attributes('-zoomed', True)
+    else:
+        w = max(min_w, int(sw * fraction))
+        h = max(min_h, int(sh * fraction))
+        x = (sw - w) // 2
+        y = (sh - h) // 2
+        root.geometry(f'{w}x{h}+{x}+{y}')
+
+    root.minsize(min_w, min_h)
 
 
 def _load_bp_csv_old(path: 'Path') -> dict:

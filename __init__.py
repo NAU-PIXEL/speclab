@@ -64,17 +64,15 @@ from .utils import (
     loadReflectanceCSV,
     saveReflectanceCSV,
     loadASD,
-    readDVhdf,
-    saveDVhdf,
-    dv_to_album,
+    readHDF,
+    saveHDF,
     save_emcal_csv,
     save_sma_csv,
     printStructInfo,
-    recursiveHDFreader,
     save_band_parameters_csv,
     load_band_parameters_csv,
 )
 from . import plot
 from .config import configure, get_config
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

@@ -39,7 +39,7 @@ if __package__ is None:
 
 from .functions import load_sbm, cal_rad, emcal, sma, resample_spectrum, merge, scan_sample_labels, MissingTempsError
 from .plot import _add_top_axis
-from .utils import readOMNIC, readEmissionCSVnotes, findFiles, readDVhdf, saveDVhdf, save_emcal_csv, save_sma_csv, c2k, r2t_nau, dv_to_album
+from .utils import readOMNIC, readEmissionCSVnotes, findFiles, readHDF, saveHDF, save_emcal_csv, save_sma_csv, c2k, r2t_nau, _to_album, _set_window_size
 from .config import get_config
 from . import __version__
 from .SpeclibViewer import (
@@ -944,8 +944,8 @@ class EmissionLWIR(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(f'EmissionLWIR  v{__version__}')
-        self.geometry('1500x900')
-        self.minsize(1100, 650)
+        _set_window_size(self, fraction=0.85, min_w=1100, min_h=650)
+        self._sw = self.winfo_screenwidth()
 
         # ── Processing state ────────────────────────────────────────────────
         self._fdir:         str | None  = None
@@ -975,7 +975,7 @@ class EmissionLWIR(tk.Tk):
         # ── Speclib figure secondary axis ────────────────────────────────────
         self._sl_secax = None
 
-        # ── Speclib tab state (mirrored from SpeclibViewerLWIR) ──────────────
+        # ── Speclib tab state ────────────────────────────────────────────────
         self._full_library:  dict = {}
         self._current_album: dict = {}
         self._extra_libs:    dict = {}
@@ -1177,7 +1177,7 @@ class EmissionLWIR(tk.Tk):
         paned.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
         # Left: sample list + radiance/emissivity toggle
-        left = ttk.Frame(paned, width=225)
+        left = ttk.Frame(paned, width=int(self._sw * 0.13))
         left.pack_propagate(False)
         paned.add(left, weight=0)
 
@@ -1275,7 +1275,6 @@ class EmissionLWIR(tk.Tk):
         isb.pack(side=tk.RIGHT, fill=tk.Y)
 
     # ── Speclib tab ─────────────────────────────────────────────────────────
-    # Adapted from SpeclibViewerLWIR with excluded/forced endmember additions.
 
     def _build_speclib_tab(self) -> None:
         # Top: source selector
@@ -1289,7 +1288,7 @@ class EmissionLWIR(tk.Tk):
         paned = ttk.PanedWindow(self._tab_speclib, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
-        left = ttk.Frame(paned, width=225)
+        left = ttk.Frame(paned, width=int(self._sw * 0.13))
         left.pack_propagate(False)
         paned.add(left, weight=0)
 
@@ -1369,7 +1368,7 @@ class EmissionLWIR(tk.Tk):
         paned.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
         # Left: sample list + action buttons
-        left = ttk.Frame(paned, width=225)
+        left = ttk.Frame(paned, width=int(self._sw * 0.13))
         left.pack_propagate(False)
         paned.add(left, weight=0)
 
@@ -1599,10 +1598,10 @@ class EmissionLWIR(tk.Tk):
         if not path:
             return
         try:
-            d = readDVhdf(path)
+            d = readHDF(path)
         except Exception as exc:
             messagebox.showerror('Load failed', str(exc))
-            logging.exception("readDVhdf failed for %s", path)
+            logging.exception("readHDF failed for %s", path)
             return
 
         # Detect result type — filename first, content fallback, user prompt last
@@ -1714,7 +1713,7 @@ class EmissionLWIR(tk.Tk):
         endlib = d.get('endlib')
         if endlib and isinstance(endlib, dict) and len(endlib) > 0:
             try:
-                album = dv_to_album(endlib)
+                album = _to_album(endlib)
                 self._full_library  = album
                 self._browse_source = album
                 self._sl_lib_path   = source_path
@@ -2277,7 +2276,7 @@ class EmissionLWIR(tk.Tk):
             hdf_path = os.path.join(folder, f'emcal_results_{timestamp}.hdf')
             csv_path = hdf_path.replace('.hdf', '.csv')
             try:
-                saveDVhdf(result, hdf_path)
+                saveHDF(result, hdf_path)
                 saved.append(hdf_path)
                 logging.info("Saved emcal result%s → %s", tag, hdf_path)
             except Exception as exc:
@@ -2295,7 +2294,7 @@ class EmissionLWIR(tk.Tk):
             hdf_path = os.path.join(folder, f'sma_results_{timestamp}.hdf')
             csv_path = hdf_path.replace('.hdf', '.csv')
             try:
-                saveDVhdf(result, hdf_path)
+                saveHDF(result, hdf_path)
                 saved.append(hdf_path)
                 logging.info("Saved sma result → %s", hdf_path)
             except Exception as exc:
@@ -2321,7 +2320,7 @@ class EmissionLWIR(tk.Tk):
                 folder_name = Path(fdir).name
                 hdf_path = os.path.join(fdir, f'calrad_results_{timestamp}.hdf')
                 try:
-                    saveDVhdf(ind_result, hdf_path)
+                    saveHDF(ind_result, hdf_path)
                     saved.append(hdf_path)
                     logging.info("Saved cal_rad result (%s) → %s", folder_name, hdf_path)
                 except Exception as exc:
@@ -2937,7 +2936,7 @@ class EmissionLWIR(tk.Tk):
         self._an_refresh_table()
 
     # -----------------------------------------------------------------------
-    # Speclib tab methods  (adapted from SpeclibViewerLWIR)
+    # Speclib tab methods
     # -----------------------------------------------------------------------
 
 

@@ -55,7 +55,7 @@ if __package__ is None:
     __package__ = 'speclab'
 
 from .functions import resample_spectrum, load_instrument_grids, insert_plot_gaps
-from .utils import readDVhdf, saveDVhdf
+from .utils import readHDF, saveHDF, _set_window_size
 from .config import get_config
 from . import __version__
 
@@ -108,9 +108,9 @@ def _load_hdf(path: str) -> dict:
     Load a spectral library HDF5 file into the ``{spec_id: entry}`` album
     format used internally by the viewer.
 
-    Delegates I/O to :func:`utils.readDVhdf` and handles two on-disk layouts:
+    Delegates I/O to :func:`utils.readHDF` and handles two on-disk layouts:
 
-    * **Per-spectrum** (``saveDVhdf`` / SpeclibViewer export) — one sub-group
+    * **Per-spectrum** (``saveHDF`` / SpeclibViewer export) — one sub-group
       per spectrum at the top level.  String integer keys are cast to ``int``
       spec-IDs.
     * **Grouped** (``makeASUspeclib_dev`` / DaVinci native) — a shared
@@ -136,7 +136,7 @@ def _load_hdf(path: str) -> dict:
     ValueError
         If the loaded dict does not match either recognised layout.
     """
-    raw = readDVhdf(path, collapse=False)
+    raw = readHDF(path, collapse=False)
 
     def _expand_group(grp: dict, start_id: int, album: dict) -> int:
         """Expand a grouped sub-dict (shared xaxis + 2-D data) into album."""
@@ -506,8 +506,8 @@ class SpeclibViewer(tk.Toplevel):
             self._standalone_root = None
         super().__init__(master)
         self.title(f'SpeclibViewer  v{__version__}')
-        self.geometry('1400x860')
-        self.minsize(1000, 620)
+        _set_window_size(self, fraction=0.85, min_w=1000, min_h=620)
+        self._sw = self.winfo_screenwidth()
 
         # Data state
         self._full_library:   dict = {}
@@ -641,7 +641,7 @@ class SpeclibViewer(tk.Toplevel):
         paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True, padx=6, pady=(2, 6))
 
-        left = ttk.Frame(paned, width=400)
+        left = ttk.Frame(paned, width=int(self._sw * 0.22))
         paned.add(left, weight=0)
 
         right = ttk.Frame(paned)
@@ -1844,13 +1844,13 @@ class ExportDialog(tk.Toplevel):
 
 def _export_album(album: dict, path: str, *, mode: str = 'LWIR') -> None:
     """
-    Write album spectra to HDF5 using saveDVhdf.
+    Write album spectra to HDF5 using saveHDF.
 
     Each spectrum is stored as a group keyed by its spec_id (as a string).
     The internal ``hdf_group`` bookkeeping key is excluded from the output.
     ``x_unit`` / ``y_unit`` are injected (or overwritten) so the exported
     file is self-describing for :func:`_detect_library_mode`.
-    The resulting file is readable by ``_load_hdf`` / ``readDVhdf``.
+    The resulting file is readable by ``_load_hdf`` / ``readHDF``.
     """
     x_unit = 'nm'          if mode == 'VSWIR' else 'cm-1'
     y_unit = 'reflectance' if mode == 'VSWIR' else 'emissivity'
@@ -1863,7 +1863,7 @@ def _export_album(album: dict, path: str, *, mode: str = 'LWIR') -> None:
         }
         for sid, entry in album.items()
     }
-    saveDVhdf(data, path)
+    saveHDF(data, path)
 
 
 # ---------------------------------------------------------------------------

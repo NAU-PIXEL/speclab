@@ -33,14 +33,16 @@ from collections.abc import Callable
 from datetime import datetime
 
 from . import utils
-from .utils import dv_to_album
+from .utils import _to_album
 from .plot import plot_emcal, plot_tracal, plot_sma
 import h5py
 import matplotlib.pyplot as plt
 import numpy as np
+
 import pandas as pd
 from sklearn.metrics import r2_score, root_mean_squared_error
 from scipy.optimize import curve_fit, nnls, lsq_linear, minimize, minimize_scalar, NonlinearConstraint
+from scipy.integrate import simpson
 from scipy.signal import find_peaks, savgol_filter
 from scipy.ndimage import uniform_filter1d, median_filter, gaussian_filter1d
 
@@ -255,7 +257,7 @@ def band_parameters(
     base_mask = (x_sub >= wl_left_base) & (x_sub <= wl_right_base)
     x_base    = x_sub[base_mask]
     cr_base   = cr_sub[base_mask]
-    band_area = float(np.trapz(1.0 - cr_base, x_base)) if len(x_base) >= 2 else 0.0
+    band_area = float(simpson(1.0 - cr_base, x=x_base)) if len(x_base) >= 2 else 0.0
 
     band_area_ratio = band_area / (band_depth * base_width) if base_width > 0 else 0.0
 
@@ -1712,7 +1714,7 @@ def emcal(
         sep       = '_' if timestamp else ''
         fname_hdf = fdir + f"/emcal_results{sep}{timestamp}.hdf"
         fname_csv = fdir + f"/emcal_results{sep}{timestamp}.csv"
-        utils.saveDVhdf(out, fname_hdf)
+        utils.saveHDF(out, fname_hdf)
         logging.info("Saved HDF to %s", fname_hdf)
         utils.save_emcal_csv(out, fname_csv)
         logging.info("Saved CSV to %s", fname_csv)
@@ -2320,19 +2322,19 @@ def sma(
     # ------------------------------------------------------------------
     # Load from file if paths are given
     if isinstance(em_data, str):
-        em_data = utils.readDVhdf(em_data)
+        em_data = utils.readHDF(em_data)
     if isinstance(endlib, str):
-        endlib = dv_to_album(utils.readDVhdf(endlib))
+        endlib = _to_album(utils.readHDF(endlib))
     elif isinstance(endlib, dict):
-        endlib = dv_to_album(endlib)
+        endlib = _to_album(endlib)
     if isinstance(forcedlib, str):
-        forcedlib = dv_to_album(utils.readDVhdf(forcedlib))
+        forcedlib = _to_album(utils.readHDF(forcedlib))
     elif isinstance(forcedlib, dict):
-        forcedlib = dv_to_album(forcedlib)
+        forcedlib = _to_album(forcedlib)
     if isinstance(atmlib, str):
-        atmlib = dv_to_album(utils.readDVhdf(atmlib))
+        atmlib = _to_album(utils.readHDF(atmlib))
     elif isinstance(atmlib, dict):
-        atmlib = dv_to_album(atmlib)
+        atmlib = _to_album(atmlib)
 
     # Accept an emcal output dict in place of separate em_data / em_xaxis
     # Save the dict reference before it is overwritten so slope temperature
@@ -3051,7 +3053,7 @@ def sma(
         out_dir   = os.path.abspath(save_path) if save_path else os.getcwd()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         base      = os.path.join(out_dir, f"sma_results_{timestamp}")
-        utils.saveDVhdf(smaout, base + ".hdf")
+        utils.saveHDF(smaout, base + ".hdf")
         logging.info("Saved SMA HDF → %s.hdf", base)
         utils.save_sma_csv(smaout, base + ".csv", group=group)
 
@@ -4755,7 +4757,7 @@ def save_instrument_grids(
     for name, fname in _INSTRUMENT_FILES.items():
         path = f'{speclib_dir}/{fname}'
         try:
-            arrays[name] = utils.readDVhdf(path)['xaxis']
+            arrays[name] = utils.readHDF(path)['xaxis']
         except Exception as exc:
             logging.warning(f'load_instrument_grids: skipping {name} ({exc})')
 
@@ -5552,10 +5554,10 @@ def merge(
         beyond the first so its maximum in the overlap zone matches that of
         input 1.  Default ``True``.
     save : bool, optional
-        If ``True``, save the result via ``utils.saveDVhdf``.  Requires
+        If ``True``, save the result via ``utils.saveHDF``.  Requires
         *save_path*.  Default ``False``.
     save_path : str or None, optional
-        Output path for ``utils.saveDVhdf``.  Required when ``save=True``.
+        Output path for ``utils.saveHDF``.  Required when ``save=True``.
 
     Returns
     -------
@@ -5594,7 +5596,7 @@ def merge(
     for i, inp in enumerate(inputs, start=1):
         if isinstance(inp, str):
             logging.info("merge: loading input %d from '%s'", i, inp)
-            dicts.append(utils.readDVhdf(inp))
+            dicts.append(utils.readHDF(inp))
         elif isinstance(inp, dict):
             dicts.append(inp)
         else:
@@ -5625,7 +5627,7 @@ def merge(
     if save:
         if save_path is None:
             raise ValueError("merge: save=True requires a save_path.")
-        utils.saveDVhdf(result, save_path)
+        utils.saveHDF(result, save_path)
         logging.info("merge: saved merged dict to '%s'", save_path)
 
     return result
@@ -5864,7 +5866,7 @@ def _ratio_cal_impl(
         sep       = '_' if timestamp else ''
 
         hdf_path = os.path.join(fdir, f'{prefix}_results{sep}{timestamp}.hdf')
-        utils.saveDVhdf(out, hdf_path)
+        utils.saveHDF(out, hdf_path)
         logging.info("%s HDF saved: %s", mode, hdf_path)
 
         csv_path = os.path.join(fdir, f'{prefix}_results{sep}{timestamp}.csv')

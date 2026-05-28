@@ -10,7 +10,7 @@ Three on-disk DV layouts are handled:
     flat DaVinci  — top-level datasets: ``data`` (n_spec, n_pts),
                     ``xaxis`` (n_pts,), string fields packed as
                     newline-delimited byte strings in shape (1,).
-                    This layout breaks ``sma`` because ``readDVhdf``
+                    This layout breaks ``sma`` because ``readHDF``
                     returns a field-name dict rather than an album dict.
 
     per-spectrum  — one HDF5 group per spectrum keyed by spec-id or
@@ -86,7 +86,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .utils import readDVhdf, saveDVhdf, dv_to_album
+from .utils import readHDF, saveHDF, _to_album
 
 log = logging.getLogger(__name__)
 
@@ -273,7 +273,7 @@ def convert_usgs_splib07(
 
     Reads the ASCII text files from the splib07 download directory and writes
     a single speclab-compatible per-spectrum HDF5 file, readable by
-    ``readDVhdf`` / ``dv_to_album``.
+    ``readHDF`` / ``_to_album``.
 
     Parameters
     ----------
@@ -477,7 +477,7 @@ def convert_crism_speclib(
     The source file uses a flat DaVinci layout: metadata fields are packed as
     newline-delimited byte strings and spectral data are stored per specimen as
     ``(1, n_pts, n_vars)`` arrays (column 0 = wavelength in µm, column 1 =
-    reflectance).  The BSQ reversal applied by ``readDVhdf`` mangles this
+    reflectance).  The BSQ reversal applied by ``readHDF`` mangles this
     multi-variable layout, so spectral data are read directly via h5py.
 
     Parameters
@@ -502,8 +502,8 @@ def convert_crism_speclib(
     if not input_path.is_file():
         raise FileNotFoundError(f"CRISM HDF5 not found: {input_path}")
 
-    # ---- load metadata via readDVhdf (handles packed byte strings) ----------
-    meta_raw = readDVhdf(str(input_path), collapse=False)
+    # ---- load metadata via readHDF (handles packed byte strings) ----------
+    meta_raw = readHDF(str(input_path), collapse=False)
 
     def _meta_array(key: str) -> np.ndarray:
         """Return the metadata string array for key, or an empty array."""
@@ -643,15 +643,15 @@ def convert_dv_to_sv(
         The album dict that was written (sequential integer keys).
     """
     log.info("Loading '%s'", input_path)
-    raw   = readDVhdf(input_path)
-    album = dv_to_album(raw)
+    raw   = readHDF(input_path)
+    album = _to_album(raw)
     log.info("Converted %d spectra; saving to '%s'", len(album), output_path)
 
     sv_dict = {
         str(sid): {**entry, 'x_unit': x_unit, 'y_unit': y_unit}
         for sid, entry in album.items()
     }
-    saveDVhdf(sv_dict, output_path)
+    saveHDF(sv_dict, output_path)
     log.info("✓ Saved %s", output_path)
     return album
 
@@ -668,13 +668,13 @@ def test_conversion(input_path: str, output_path: str | None = None) -> None:
     Checks performed
     ----------------
     1. Conversion runs without error.
-    2. Output file is readable by ``readDVhdf``.
+    2. Output file is readable by ``readHDF``.
     3. Every top-level value in the output is a sub-dict (album format).
     4. Every entry has 1-D ``data`` and ``xaxis`` of matching length.
     5. Spectral data values are identical (within float32 precision) to
-       those loaded via the original file through ``dv_to_album``.
+       those loaded via the original file through ``_to_album``.
     6. Output file can be loaded as an ``sma``-compatible endlib
-       (``dv_to_album`` succeeds on the round-tripped file).
+       (``_to_album`` succeeds on the round-tripped file).
 
     Parameters
     ----------
@@ -699,8 +699,8 @@ def test_conversion(input_path: str, output_path: str | None = None) -> None:
         print(f"[1] Conversion OK — {n} spectra")
 
         # ---- Step 2: Reload -------------------------------------------------
-        reloaded_raw = readDVhdf(output_path)
-        print("[2] Output readable by readDVhdf ✓")
+        reloaded_raw = readHDF(output_path)
+        print("[2] Output readable by readHDF ✓")
 
         # ---- Step 3: Album format -------------------------------------------
         non_dict = [k for k, v in reloaded_raw.items() if not isinstance(v, dict)]
@@ -738,13 +738,13 @@ def test_conversion(input_path: str, output_path: str | None = None) -> None:
         print("[5] Spectral data round-trip fidelity ✓")
 
         # ---- Step 6: sma-compatible endlib ----------------------------------
-        rt_album = dv_to_album(reloaded_raw)
+        rt_album = _to_album(reloaded_raw)
         assert len(rt_album) == n, (
             f"Round-trip album has {len(rt_album)} entries, expected {n}"
         )
         first = next(iter(rt_album.values()))
         assert 'data'  in first and 'xaxis' in first
-        print("[6] Round-trip output passes dv_to_album (sma-compatible) ✓")
+        print("[6] Round-trip output passes _to_album (sma-compatible) ✓")
 
         print(f"\nAll checks passed for '{input_path}'")
 

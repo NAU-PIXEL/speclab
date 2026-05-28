@@ -46,7 +46,7 @@ from . import __version__
 from .plot import plot_band_parameters
 from .functions import remove_continuum, band_parameters, smooth_spectrum, detect_bands
 from .utils import (
-    load_reflectance_vswir, saveReflectanceCSV, readDVhdf,
+    load_reflectance_vswir, saveReflectanceCSV, readHDF, _set_window_size,
 )
 from .SpeclibViewer import SpeclibViewer
 
@@ -1798,8 +1798,7 @@ class ReflectanceVSWIR(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(f'ReflectanceVSWIR  v{__version__}')
-        self.geometry('1400x900')
-        self.minsize(1000, 660)
+        _set_window_size(self, fraction=0.85, min_w=1000, min_h=660)
 
         # ── Data state ────────────────────────────────────────────────────────
         self._data_pool:       list[dict] = []   # loaded, shown in left listbox
@@ -3496,7 +3495,7 @@ class ReflectanceVSWIR(tk.Tk):
         Load a speclab per-spectrum HDF5 spectral library and replace
         ``_library`` with the new entries.
 
-        The file is read via ``readDVhdf(collapse=False)`` to preserve
+        The file is read via ``readHDF(collapse=False)`` to preserve
         per-spectrum metadata fields.  Filter keyword dropdowns are rebuilt
         dynamically from whatever fields are present in the loaded library.
 
@@ -3507,7 +3506,7 @@ class ReflectanceVSWIR(tk.Tk):
         """
         self._set_status(f'Reading {path.name}…')
         try:
-            raw = readDVhdf(str(path), collapse=False)
+            raw = readHDF(str(path), collapse=False)
         except Exception as exc:
             self._set_status('')
             messagebox.showerror('Load Library', f'Could not read HDF:\n{exc}', parent=self)

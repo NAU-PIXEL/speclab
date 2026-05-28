@@ -27,7 +27,7 @@ import numpy as np
 
 import speclab
 from speclab import emcal, sma, summary_sma, merge
-from speclab import readDVhdf, printStructInfo, saveDVhdf, save_emcal_csv
+from speclab import readHDF, printStructInfo, saveHDF, save_emcal_csv
 from speclab.SpeclibViewer import SpeclibViewer
 
 # =============================================================================
@@ -126,7 +126,7 @@ if USE_MULTI_FOLDER:
 
     if SAVE_MERGED:
         fname = os.path.join(FDIR, 'emcal_merged_results.hdf')
-        saveDVhdf(emcal_out, fname)
+        saveHDF(emcal_out, fname)
         save_emcal_csv(emcal_out, fname.replace('.hdf', '.csv'))
         print(f"  Saved → {fname}")
 
