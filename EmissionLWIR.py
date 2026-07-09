@@ -37,7 +37,7 @@ if __package__ is None:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     __package__ = 'speclab'
 
-from .functions import load_sbm, cal_rad, emcal, sma, resample_spectrum, merge, scan_sample_labels, MissingTempsError
+from .functions import load_sbm, cal_rad, emcal, sma, resample_spectrum, merge, scan_sample_labels, MissingTempsError, read_tes, is_tes_result, moving_average
 from .plot import _add_top_axis
 from .utils import readOMNIC, readEmissionCSVnotes, findFiles, readHDF, saveHDF, save_emcal_csv, save_sma_csv, c2k, r2t_nau, _to_album, _set_window_size
 from .config import get_config
@@ -1031,6 +1031,12 @@ class EmissionLWIR(tk.Tk):
         self._notes_df   = None          # cached notes DataFrame; reset on folder load
         self._metrics_dialog: object = None
 
+        # ── Smoothing state ──────────────────────────────────────────────────
+        # Un-smoothed emissivity baseline {label: spectrum}; smoothing is always
+        # re-derived from this so it is tunable and never compounds.
+        self._pristine_emiss: dict | None = None
+        self._smooth_window:  int = 1
+
         # ── Speclib figure secondary axis ────────────────────────────────────
         self._sl_secax = None
 
@@ -1212,6 +1218,7 @@ class EmissionLWIR(tk.Tk):
         self._rb_em['state']  = _state(have_emiss)
         self._btn_data_delete['state'] = _state(have_emcal or self._raw_data is not None)
         self._btn_an_delete['state']   = _state(have_sma)
+        self._smooth_spin['state'] = _state(self._pristine_emiss is not None)
         in_radiance = have_calrad and self._data_mode_var.get() == 'radiance'
         self._cb_show_model['state']  = _state(in_radiance)
         self._rb_rad_raw['state']     = _state(in_radiance)
@@ -1293,6 +1300,20 @@ class EmissionLWIR(tk.Tk):
                                              variable=self._rad_display_var, value='corrected',
                                              command=self._refresh_data_plot)
         self._rb_rad_corr.pack(anchor=tk.W)
+        ttk.Separator(ctrl, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
+        sm_frame = ttk.Frame(ctrl)
+        sm_frame.pack(fill=tk.X)
+        ttk.Label(sm_frame, text='Smoothing (ch):').pack(side=tk.LEFT)
+        self._smooth_window_var = tk.IntVar(value=1)
+        self._smooth_spin = ttk.Spinbox(
+            sm_frame, from_=1, to=99, increment=2, width=5,
+            textvariable=self._smooth_window_var, state=tk.DISABLED,
+            command=self._apply_smoothing)
+        self._smooth_spin.pack(side=tk.LEFT, padx=4)
+        # Apply typed values on Enter / focus-out (Spinbox 'command' only fires on arrows)
+        self._smooth_spin.bind('<Return>',   lambda _e: self._apply_smoothing())
+        self._smooth_spin.bind('<FocusOut>', lambda _e: self._apply_smoothing())
+
         ttk.Separator(ctrl, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
         self._btn_data_delete = ttk.Button(
             ctrl, text='Delete spectrum', state=tk.DISABLED,
@@ -1668,20 +1689,60 @@ class EmissionLWIR(tk.Tk):
         self._load_folders_raw()
 
     def _on_load_results(self) -> None:
-        path = filedialog.askopenfilename(
-            title='Load Results',
+        paths = filedialog.askopenfilenames(
+            title='Load Results  (select multiple TES files to merge)',
             filetypes=[('HDF files', '*.hdf *.h5'), ('All files', '*')],
         )
-        if not path:
+        if not paths:
             return
-        try:
-            d = readHDF(path)
-        except Exception as exc:
-            messagebox.showerror('Load failed', str(exc))
-            logging.exception("readHDF failed for %s", path)
-            return
-        self._last_load_dir = os.path.dirname(path)
 
+        # Read and classify each selected file.
+        parsed: list[tuple[str, dict]] = []
+        for p in paths:
+            try:
+                parsed.append((p, readHDF(p)))
+            except Exception as exc:
+                messagebox.showerror('Load failed', f'{os.path.basename(p)}: {exc}')
+                logging.exception("readHDF failed for %s", p)
+                return
+
+        tes   = [p for p, d in parsed if is_tes_result(d)]
+        other = [p for p, d in parsed if not is_tes_result(d)]
+        if tes and other:
+            messagebox.showwarning(
+                'Mixed selection',
+                'Select either TES files or a single standard result file — '
+                'not both.')
+            return
+
+        self._last_load_dir = os.path.dirname(parsed[0][0])
+
+        # TES: convert each file and vertically merge into one emissivity result.
+        if tes:
+            try:
+                tes_dicts = [read_tes(p) for p in tes]
+                merged = tes_dicts[0] if len(tes_dicts) == 1 else merge(*tes_dicts)
+            except Exception as exc:
+                messagebox.showerror('TES load failed', str(exc))
+                logging.exception("read_tes/merge failed")
+                return
+            self._load_emcal_result(merged)
+            logging.info("Loaded %d TES file(s) → %d spectra",
+                         len(tes_dicts), len(merged.get('label', [])))
+            return
+
+        # Standard result files: single-file only.
+        if len(other) != 1:
+            messagebox.showwarning(
+                'Multiple files',
+                'Multi-select is only supported for TES files. Select a single '
+                'emcal or sma result file.')
+            return
+        path, d = parsed[0]
+        self._dispatch_result(path, d)
+
+    def _dispatch_result(self, path: str, d: dict) -> None:
+        """Detect a standard result file's type and route it to the loader."""
         # Detect result type — filename first, content fallback, user prompt last
         basename = os.path.basename(path)
         if 'emcal_results' in basename:
@@ -1733,6 +1794,7 @@ class EmissionLWIR(tk.Tk):
         else:
             self._raw_data = None
 
+        self._capture_pristine_emiss()
         mode = 'radiance' if d.get('rad') else 'emissivity'
         self._data_mode_var.set(mode)
         self._data_mode = mode
@@ -1785,6 +1847,7 @@ class EmissionLWIR(tk.Tk):
             }
         else:
             self._emcal_result = None
+        self._capture_pristine_emiss()
 
         # Restore endmember library into the Speclib tab
         # Works for both our per-entry format and the flat DaVinci struct format
@@ -1925,6 +1988,8 @@ class EmissionLWIR(tk.Tk):
             self._delete_sample_sma(self._sma_result, label)
         if self._raw_data is not None:
             self._delete_sample_raw(self._raw_data, label)
+        if self._pristine_emiss is not None:
+            self._pristine_emiss.pop(label, None)
 
         self._data_label = None
         self._sma_label  = None
@@ -2396,6 +2461,7 @@ class EmissionLWIR(tk.Tk):
 
         self._emcal_result = result
         self._clear_analysis()
+        self._capture_pristine_emiss()
         self._data_mode_var.set('emissivity')
         self._data_mode = 'emissivity'
         self._populate_data_tab()
@@ -2465,6 +2531,7 @@ class EmissionLWIR(tk.Tk):
             self._individual_emcal_results = individual_results
             self._emcal_result = merged
             self._clear_analysis()
+            self._capture_pristine_emiss()
             self._data_mode_var.set('emissivity')
             self._data_mode = 'emissivity'
             self._populate_data_tab()
@@ -2586,6 +2653,39 @@ class EmissionLWIR(tk.Tk):
         if errors:
             messagebox.showerror('Save errors', '\n'.join(errors))
 
+    def _suggest_sma_wn_range(self, base, endlib: dict, forcedlib: dict) -> tuple:
+        """
+        Clamp a fit window to the coverage of the data and every endmember.
+
+        Returns an ``(lo, hi)`` window that lies within the measured spectral
+        axis and within every (forced or regular) endmember's native range, so
+        ``sma()`` will not reject an endmember for insufficient overlap or NaNs.
+        The window is only ever narrowed relative to *base*, never widened;
+        bounds are rounded strictly inward so they stay inside every source
+        range. Falls back to *base* if the intersection is degenerate.
+        """
+        lo, hi = float(base[0]), float(base[1])
+        xaxis = np.asarray(self._emcal_result.get('xaxis', []), dtype=float)
+        if xaxis.size:
+            lo = max(lo, float(xaxis.min()))
+            hi = min(hi, float(xaxis.max()))
+        mins: list[float] = []
+        maxs: list[float] = []
+        for lib in (endlib, forcedlib):
+            for entry in (lib or {}).values():
+                ex = np.asarray(entry.get('xaxis', []), dtype=float)
+                if ex.size:
+                    mins.append(float(ex.min()))
+                    maxs.append(float(ex.max()))
+        if mins:
+            lo = max(lo, max(mins))    # window must start at/above every endmember's start
+            hi = min(hi, min(maxs))    # window must end at/below every endmember's end
+        lo = float(np.ceil(lo))
+        hi = float(np.floor(hi))
+        if hi <= lo:
+            return tuple(float(x) for x in base)
+        return (lo, hi)
+
     def _on_run_sma(self) -> None:
         if not self._emcal_result:
             messagebox.showwarning('No emcal result', 'Run emcal() first.')
@@ -2594,14 +2694,21 @@ class EmissionLWIR(tk.Tk):
             messagebox.showwarning('No library', 'Load a spectral library first.')
             return
 
-        dlg = SmaOptionsDialog(self, self._sma_opts)
+        endlib    = self._build_endlib()
+        forcedlib = self._build_forcedlib()
+
+        # Pre-fill the fit window clamped to what the data + library can support,
+        # so the default won't trip sma()'s coverage/NaN checks (e.g. TES data,
+        # which only spans ~233–1301 cm⁻¹).
+        dlg_defaults = dict(self._sma_opts)
+        dlg_defaults['wn_range'] = self._suggest_sma_wn_range(
+            self._sma_opts['wn_range'], endlib, forcedlib)
+
+        dlg = SmaOptionsDialog(self, dlg_defaults)
         if dlg.result is None:
             return
         self._sma_opts.update(dlg.result)
         opts = dlg.result
-
-        endlib   = self._build_endlib()
-        forcedlib = self._build_forcedlib()
 
         try:
             result = sma(
@@ -2631,6 +2738,43 @@ class EmissionLWIR(tk.Tk):
     # -----------------------------------------------------------------------
     # Data tab methods
     # -----------------------------------------------------------------------
+
+    def _capture_pristine_emiss(self) -> None:
+        """Snapshot the current emissivity as the un-smoothed baseline; reset window to 1."""
+        r = self._emcal_result
+        if r is not None and isinstance(r.get('emiss'), dict):
+            self._pristine_emiss = {
+                str(lbl): np.array(spec, dtype=float, copy=True)
+                for lbl, spec in r['emiss'].items()
+            }
+        else:
+            self._pristine_emiss = None
+        self._smooth_window = 1
+        if hasattr(self, '_smooth_window_var'):
+            self._smooth_window_var.set(1)
+
+    def _apply_smoothing(self) -> None:
+        """Re-derive emissivity data/emiss from the pristine baseline at the current window."""
+        r = self._emcal_result
+        if r is None or self._pristine_emiss is None:
+            return
+        try:
+            win = max(1, int(self._smooth_window_var.get()))
+        except (tk.TclError, ValueError):
+            return
+        self._smooth_window = win
+
+        labels = [str(l) for l in r.get('label', [])]
+        base_rows = [
+            self._pristine_emiss.get(lbl, np.asarray(r['emiss'][lbl], dtype=float))
+            for lbl in labels
+        ]
+        if not base_rows:
+            return
+        smoothed = moving_average(np.vstack(base_rows), win)   # win<=1 → unchanged copy
+        r['data']  = smoothed
+        r['emiss'] = {lbl: smoothed[i] for i, lbl in enumerate(labels)}
+        self._refresh_data_plot()
 
     def _populate_data_tab(self) -> None:
         r   = self._emcal_result

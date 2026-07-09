@@ -283,6 +283,40 @@ def band_parameters(
 
 
 # =============================================================================
+# ========================= moving_average =====================================
+# =============================================================================
+
+def moving_average(data: np.ndarray, window: int, axis: int = -1) -> np.ndarray:
+    """
+    Simple centered moving-average (boxcar) smoothing along *axis*.
+
+    A window-based smoother expressed directly in samples (channels), suitable
+    for any spectral axis regardless of units.  Edges use ``'nearest'`` handling
+    so the output length matches the input.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        Input array; smoothing is applied along *axis*.  For a stack of spectra
+        of shape ``(n_spectra, n_bands)`` the default *axis* smooths each
+        spectrum independently.
+    window : int
+        Boxcar width in samples.  Values ``<= 1`` return an unmodified copy.
+    axis : int
+        Axis along which to smooth.  Default ``-1`` (the spectral axis).
+
+    Returns
+    -------
+    np.ndarray
+        Smoothed array, same shape as *data*, dtype float64.
+    """
+    arr = np.asarray(data, dtype=float)
+    if window is None or window <= 1:
+        return arr.copy()
+    return uniform_filter1d(arr, size=int(window), axis=axis, mode='nearest')
+
+
+# =============================================================================
 # ========================= smooth_spectrum ====================================
 # =============================================================================
 
@@ -5502,6 +5536,102 @@ def match(
         'xaxis': union_x,
         'wl':    1e4 / union_x,
         'data':  np.nanmean(np.vstack([r1, r2]), axis=0),
+    }
+
+
+# Datasets expected in a TES surface-emissivity result file.
+_TES_KEYS = ('tesx73', 'surf_emiss73', 'det', 'ick', 'ock')
+
+
+def is_tes_result(d: dict) -> bool:
+    """
+    Return ``True`` if *d* looks like a TES surface-emissivity result.
+
+    Parameters
+    ----------
+    d : dict
+        Dict as returned by :func:`utils.readHDF`.
+
+    Returns
+    -------
+    bool
+        ``True`` when every expected TES dataset name is present.
+    """
+    return all(k in d for k in _TES_KEYS)
+
+
+def read_tes(path: str) -> dict:
+    """
+    Read a TES surface-emissivity HDF5 file into an emcal-style emissivity dict.
+
+    Thermal Emission Spectrometer (TES) result files store surface emissivity
+    retrievals under raw dataset names (``surf_emiss73`` / ``tesx73``) with
+    per-spectrum detector and observation identifiers (``det`` / ``ick`` /
+    ``ock``).  This converts them to the emissivity convention used throughout
+    speclab (``xaxis`` / ``label`` / ``data`` / ``emiss``), so the result can be
+    passed to :func:`merge`, saved via :func:`utils.saveHDF`, or loaded directly
+    by the EmissionLWIR GUI.
+
+    Spectra are labelled ``"OCK{ock}-ICK{ick}-det{det}"``, which uniquely
+    identifies each TES pixel (orbit/observation counters + detector 1–6).
+
+    Parameters
+    ----------
+    path : str
+        Path to a TES result HDF5 file.
+
+    Returns
+    -------
+    dict
+        Emissivity result with keys ``xaxis`` (n_bands,), ``wl`` (n_bands,),
+        ``label`` (list of n_spectra str), ``data`` (n_spectra, n_bands), and
+        ``emiss`` ({label: spectrum}).
+
+    Raises
+    ------
+    KeyError
+        If the file lacks the expected TES datasets.
+    ValueError
+        If the emissivity band axis does not match the spectral axis length,
+        or the per-spectrum identifiers do not align with the spectra count.
+    """
+    d = utils.readHDF(path)
+    missing = [k for k in _TES_KEYS if k not in d]
+    if missing:
+        raise KeyError(
+            f"{os.path.basename(path)} is not a TES result file "
+            f"(missing {', '.join(missing)})."
+        )
+
+    xaxis = np.asarray(d['tesx73'], dtype=float).ravel()          # (n_bands,)
+    emiss = np.asarray(d['surf_emiss73'], dtype=float)            # band axis first
+    if emiss.ndim == 1:
+        emiss = emiss[:, np.newaxis]
+    if emiss.shape[0] != xaxis.size:
+        raise ValueError(
+            f"surf_emiss73 leading axis ({emiss.shape[0]}) does not match "
+            f"tesx73 length ({xaxis.size}) in {os.path.basename(path)}."
+        )
+    data = emiss.reshape(emiss.shape[0], -1).T                    # (n_spectra, n_bands)
+
+    det = np.atleast_1d(np.asarray(d['det'])).ravel()
+    ick = np.atleast_1d(np.asarray(d['ick'])).ravel()
+    ock = np.atleast_1d(np.asarray(d['ock'])).ravel()
+    if not (len(det) == len(ick) == len(ock) == data.shape[0]):
+        raise ValueError(
+            f"TES identifier lengths (det={len(det)}, ick={len(ick)}, "
+            f"ock={len(ock)}) do not match {data.shape[0]} spectra in "
+            f"{os.path.basename(path)}."
+        )
+    labels = [f"OCK{int(o)}-ICK{int(i)}-det{int(x)}"
+              for o, i, x in zip(ock, ick, det)]
+
+    return {
+        'xaxis': xaxis,
+        'wl':    1e4 / xaxis,
+        'label': labels,
+        'data':  data,
+        'emiss': {lbl: data[i] for i, lbl in enumerate(labels)},
     }
 
 

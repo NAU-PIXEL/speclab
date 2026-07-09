@@ -21,6 +21,8 @@ from .functions import (
     sma,
     summary_sma,
     merge,
+    read_tes,
+    is_tes_result,
     sort_cube,
     sum_group_conc,
     scan_sample_labels,
@@ -29,6 +31,7 @@ from .functions import (
     save_instrument_grids,
     load_instrument_grids,
     INSTRUMENT_PRESETS,
+    moving_average,
     # single-spectrum VSWIR primitives
     remove_continuum,
     band_parameters,
@@ -75,4 +78,4 @@ from .utils import (
 from . import plot
 from .config import configure, get_config
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
