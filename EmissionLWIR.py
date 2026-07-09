@@ -1064,6 +1064,7 @@ class EmissionLWIR(tk.Tk):
         self._an_error_var     = tk.BooleanVar(value=False)
         self._an_cumulative_var = tk.BooleanVar(value=True)
         self._an_other_var     = tk.BooleanVar(value=False)
+        self._an_legend_var    = tk.BooleanVar(value=True)
         self._an_threshold_var = tk.DoubleVar(value=5.0)
         self._an_offset_var    = tk.DoubleVar(value=0.0)
 
@@ -1517,6 +1518,9 @@ class EmissionLWIR(tk.Tk):
                         command=self._an_refresh_plot).pack(side=tk.LEFT, expand=True)
         ttk.Checkbutton(opts_center, text='Other',
                         variable=self._an_other_var,
+                        command=self._an_refresh_plot).pack(side=tk.LEFT, expand=True)
+        ttk.Checkbutton(opts_center, text='Legend',
+                        variable=self._an_legend_var,
                         command=self._an_refresh_plot).pack(side=tk.LEFT, expand=True)
         ttk.Label(opts_center, text='Threshold (%)').pack(side=tk.LEFT, padx=(8, 2))
         ttk.Spinbox(
@@ -3950,7 +3954,8 @@ class EmissionLWIR(tk.Tk):
             ax_top.axhline(1.0, color='k', lw=0.8, ls='--', zorder=0)
             ax_top.set_title(title)
             ax_top.tick_params(labelbottom=False)
-            ax_top.legend(fontsize=8)
+            if self._an_legend_var.get():
+                ax_top.legend(fontsize=8)
             _add_top_axis(ax_top)
 
         # Measured / modeled panel
@@ -3966,7 +3971,8 @@ class EmissionLWIR(tk.Tk):
             ax_bot.plot(xaxis, model_i, c='m', lw=1.0, ls='-', label='Modeled')
         _shade_excluded(ax_bot)
         ax_bot.set_ylabel('Emissivity')
-        ax_bot.legend(fontsize=8)
+        if self._an_legend_var.get():
+            ax_bot.legend(fontsize=8)
         ax_bot.set_xlim(xaxis.min(), xaxis.max())
         ax_bot.invert_xaxis()
         if ax_top is None:
