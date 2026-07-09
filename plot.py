@@ -21,23 +21,26 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 
+# ---------------------------------------------------------------------------
+# Global rcParams — match the demo script figure style
+# ---------------------------------------------------------------------------
 plt.rcParams.update({
-    'font.size':               12,
-    'lines.linewidth':         1.0,
-    'axes.prop_cycle':         plt.cycler(color=plt.cm.Dark2.colors),
-    'xtick.direction':         'in',
-    'xtick.top':               True,
-    'ytick.direction':         'in',
-    'xtick.labelsize':         11,
-    'ytick.right':             True,
-    'ytick.labelsize':         11,
-    'axes.grid':               True,
-    'axes.axisbelow':          True,
-    'axes.labelsize':          12,
-    'axes.titlesize':          12,
-    'grid.linestyle':          '--',
-    'axes.formatter.limits':   (-4, 4),
-    'errorbar.capsize':        2,
+    'font.size':                   11,
+    'axes.labelsize':              9,
+    'axes.titlesize':              12,
+    'xtick.labelsize':             9,
+    'xtick.direction':             'in',
+    'ytick.labelsize':             9,
+    'ytick.direction':             'in',
+    'lines.linewidth':             0.9,
+    'axes.grid':                   True,
+    'grid.linewidth':              0.5,
+    'grid.alpha':                  0.5,
+    'grid.linestyle':              '--',
+    'axes.axisbelow':              True,
+    'figure.constrained_layout.use': True,
+    'axes.formatter.limits':       (-4, 4),
+    'errorbar.capsize':             2,
 })
 
 # 40-color palette matching the viewer's analysis-tab _AN_COLORS.

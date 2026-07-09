@@ -74,6 +74,64 @@ _TAG_EXCL  = 'excluded'
 _TAG_FORCE = 'forced'
 _PAGE_SIZE = 10
 
+# ── Per-sample key registries (used by the "Delete spectrum" feature) ────────
+# Only keys whose leading axis (or dict membership) indexes the sample are
+# listed here; everything else — band axes, endmember-axis arrays, calib,
+# scalars — is shared and must be left untouched when a sample is removed.
+
+# emcal result: label-keyed sub-dicts. ``rad`` / ``sbm`` additionally hold
+# 'bbc' / 'bbh' entries, which are removed by label (never matched) → safe.
+_EMCAL_SAMPLE_DICTS = (
+    'emiss', 'emiss_full', 'rad0', 'sample_temps',
+    'sample_t_wavenumber', 'rad', 'sbm',
+)
+
+# sma result: top-level arrays/lists whose axis-0 is the sample index.
+_SMA_SAMPLE_KEYS = (
+    'sample_labels', 'conc', 'normconc', 'bb', 'bb_normconc', 'rms',
+    'error', 'bberror', 'slope', 'slopeerror', 'normerror', 'slope_normconc',
+    'delta_t_estimated', 'measured', 'measured_fit', 'modeled', 'sort',
+    'atm_conc',
+)
+
+# sma result: per-sample arrays nested inside the ``grouped`` sub-dict.
+_SMA_GROUPED_SAMPLE_KEYS = (
+    'grouped_bb', 'grouped_bberror', 'grouped_conc', 'grouped_error',
+    'grouped_normconc', 'grouped_normerror', 'grouped_slope',
+    'grouped_slopeerror', 'grouped_sort',
+)
+
+
+def _delete_axis0(value: object, idx: int, n: int) -> object:
+    """
+    Remove index *idx* along the leading axis of *value* iff its length is *n*.
+
+    Handles NumPy arrays and Python lists; any other type, or a length that
+    does not match *n*, is returned unchanged. The length guard is what keeps
+    shared axes (band grids, endmember arrays) and mixed-length sub-tables
+    (e.g. length-2 blackbody note columns) from being touched.
+
+    Parameters
+    ----------
+    value : object
+        Candidate per-sample container.
+    idx : int
+        Sample index to drop.
+    n : int
+        Expected number of samples; only containers of this leading length
+        are modified.
+
+    Returns
+    -------
+    object
+        A new container with the sample removed, or *value* unchanged.
+    """
+    if isinstance(value, np.ndarray) and value.ndim >= 1 and value.shape[0] == n:
+        return np.delete(value, idx, axis=0)
+    if isinstance(value, list) and len(value) == n:
+        return [x for i, x in enumerate(value) if i != idx]
+    return value
+
 # Named color palettes available via the toolbar color-scheme selector.
 # 'Standard' and 'Dark' are matplotlib qualitative; the rest are
 def _lighten_colors(colors: list, factor: float = 0.5) -> list:
@@ -950,6 +1008,7 @@ class EmissionLWIR(tk.Tk):
         # ── Processing state ────────────────────────────────────────────────
         self._fdir:         str | None  = None
         self._fdirs:        list[str]   = []     # non-empty → multi-folder mode
+        self._last_load_dir: str | None = None   # dir of last loaded results/data → save default
         self._raw_data:     dict | None = None   # SBM loaded on folder select
         self._emcal_result: dict | None = None
         self._sma_result:   dict | None = None
@@ -1090,6 +1149,12 @@ class EmissionLWIR(tk.Tk):
             row1, text='Save Results', command=self._on_save_results)
         self._btn_save_results.pack(side=tk.RIGHT, padx=2)
 
+        # Optional filename suffix; blank → timestamp (see _on_save_results).
+        self._suffix_var = tk.StringVar(value='')
+        self._suffix_entry = ttk.Entry(row1, textvariable=self._suffix_var, width=18)
+        self._suffix_entry.pack(side=tk.RIGHT, padx=2)
+        ttk.Label(row1, text='Suffix (leave blank for a timestamp):').pack(side=tk.RIGHT, padx=(6, 2))
+
         ttk.Separator(row1, orient=tk.VERTICAL).pack(
             side=tk.RIGHT, fill=tk.Y, padx=6, pady=2)
 
@@ -1145,6 +1210,8 @@ class EmissionLWIR(tk.Tk):
         self._rb_sbm['state'] = _state(self._raw_data is not None)
         self._rb_rad['state'] = _state(have_calrad)
         self._rb_em['state']  = _state(have_emiss)
+        self._btn_data_delete['state'] = _state(have_emcal or self._raw_data is not None)
+        self._btn_an_delete['state']   = _state(have_sma)
         in_radiance = have_calrad and self._data_mode_var.get() == 'radiance'
         self._cb_show_model['state']  = _state(in_radiance)
         self._rb_rad_raw['state']     = _state(in_radiance)
@@ -1226,6 +1293,11 @@ class EmissionLWIR(tk.Tk):
                                              variable=self._rad_display_var, value='corrected',
                                              command=self._refresh_data_plot)
         self._rb_rad_corr.pack(anchor=tk.W)
+        ttk.Separator(ctrl, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
+        self._btn_data_delete = ttk.Button(
+            ctrl, text='Delete spectrum', state=tk.DISABLED,
+            command=lambda: self._on_delete_sample(self._data_label))
+        self._btn_data_delete.pack(fill=tk.X)
 
         # Right: nav bar + plot + info panel
         right = ttk.Frame(paned)
@@ -1387,6 +1459,10 @@ class EmissionLWIR(tk.Tk):
         bf.pack(fill=tk.X, padx=4, pady=4)
         ttk.Button(bf, text='Save current plot', command=self._an_save_current).pack(fill=tk.X, pady=1)
         ttk.Button(bf, text='Save all plots',     command=self._an_save_all).pack(fill=tk.X, pady=1)
+        self._btn_an_delete = ttk.Button(
+            bf, text='Delete spectrum', state=tk.DISABLED,
+            command=lambda: self._on_delete_sample(self._sma_label))
+        self._btn_an_delete.pack(fill=tk.X, pady=1)
 
         # Right: nav/opts bar spanning full width, then figure | pie+table
         right = ttk.Frame(paned)
@@ -1511,6 +1587,7 @@ class EmissionLWIR(tk.Tk):
         path = filedialog.askdirectory(title='Select measurement folder')
         if not path:
             return
+        self._last_load_dir = path
 
         _EXCLUDE = {'sma_plots'}
         subdirs = sorted(
@@ -1603,6 +1680,7 @@ class EmissionLWIR(tk.Tk):
             messagebox.showerror('Load failed', str(exc))
             logging.exception("readHDF failed for %s", path)
             return
+        self._last_load_dir = os.path.dirname(path)
 
         # Detect result type — filename first, content fallback, user prompt last
         basename = os.path.basename(path)
@@ -1734,6 +1812,146 @@ class EmissionLWIR(tk.Tk):
             "Loaded sma result: %d samples, %d endmembers",
             len(labels), len(d.get('labels', [])),
         )
+
+    # -----------------------------------------------------------------------
+    # Sample deletion
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _delete_sample_emcal(d: dict, label: str) -> None:
+        """
+        Remove sample *label* in-place from an emcal-style result dict.
+
+        Deletes the matching row of ``label`` / ``data``, pops the entry from
+        every label-keyed sub-dict (``emiss``, ``rad``, ``sbm`` …; blackbody
+        ``bbc`` / ``bbh`` entries are never matched), and drops the aligned row
+        from any length-N column of the embedded ``notes`` table.
+        """
+        labels = [str(s) for s in d.get('label', [])]
+        if label not in labels:
+            return
+        idx = labels.index(label)
+        n   = len(labels)
+
+        d['label'] = _delete_axis0(d.get('label'), idx, n)
+        if 'data' in d:
+            d['data'] = _delete_axis0(d['data'], idx, n)
+
+        for key in _EMCAL_SAMPLE_DICTS:
+            sub = d.get(key)
+            if isinstance(sub, dict):
+                sub.pop(label, None)
+
+        notes = d.get('notes')
+        if isinstance(notes, dict):
+            for k, v in notes.items():
+                notes[k] = _delete_axis0(v, idx, n)
+
+    @staticmethod
+    def _delete_sample_sma(d: dict, label: str) -> None:
+        """
+        Remove sample *label* in-place from an sma-style result dict.
+
+        Every per-sample array (top-level and inside ``grouped``) has the
+        matching axis-0 slice removed; endmember-axis and shared arrays are
+        left untouched by the length guard in :func:`_delete_axis0`.
+        """
+        labels = [str(s) for s in d.get('sample_labels', [])]
+        if label not in labels:
+            return
+        idx = labels.index(label)
+        n   = len(labels)
+
+        for key in _SMA_SAMPLE_KEYS:
+            if key in d:
+                d[key] = _delete_axis0(d[key], idx, n)
+
+        gp = d.get('grouped')
+        if isinstance(gp, dict):
+            for key in _SMA_GROUPED_SAMPLE_KEYS:
+                if key in gp:
+                    gp[key] = _delete_axis0(gp[key], idx, n)
+
+    @staticmethod
+    def _delete_sample_raw(raw: dict, label: str) -> None:
+        """Remove sample *label* in-place from a reconstructed raw-data dict."""
+        labels = [str(s) for s in raw.get('labels', [])]
+        if label not in labels:
+            return
+        idx = labels.index(label)
+        n   = len(labels)
+
+        raw['labels'] = _delete_axis0(raw.get('labels'), idx, n)
+        for key in ('sbm', 'radiance', 'emissivity'):
+            sub = raw.get(key)
+            if isinstance(sub, dict):
+                sub.pop(label, None)
+        notes = raw.get('notes')
+        if notes is not None and hasattr(notes, 'loc'):
+            try:
+                raw['notes'] = notes[notes['sample_name'] != label].reset_index(drop=True)
+            except Exception:
+                logging.warning("Could not drop '%s' from raw notes table", label)
+
+    def _on_delete_sample(self, label: str | None) -> None:
+        """Delete a spectrum from every loaded in-memory result and refresh the GUI."""
+        if not label:
+            return
+
+        in_emcal = (self._emcal_result is not None
+                    and label in [str(s) for s in self._emcal_result.get('label', [])])
+        in_sma   = (self._sma_result is not None
+                    and label in [str(s) for s in self._sma_result.get('sample_labels', [])])
+        if not (in_emcal or in_sma):
+            return
+
+        if not messagebox.askyesno(
+            'Delete spectrum',
+            f'Remove "{label}" from the loaded results?\n\n'
+            'This edits the in-memory results only — the source file on disk is '
+            'not changed. Use "Save Results" to write a reduced copy.',
+            icon='warning',
+        ):
+            return
+
+        # Record the position so we can reselect a neighbour after repopulating.
+        ref_labels = (self._emcal_result.get('label', []) if in_emcal
+                      else self._sma_result.get('sample_labels', []))
+        old_idx = [str(s) for s in ref_labels].index(label)
+
+        if in_emcal:
+            self._delete_sample_emcal(self._emcal_result, label)
+        if in_sma:
+            self._delete_sample_sma(self._sma_result, label)
+        if self._raw_data is not None:
+            self._delete_sample_raw(self._raw_data, label)
+
+        self._data_label = None
+        self._sma_label  = None
+        logging.info("Deleted sample '%s'", label)
+
+        if self._emcal_result is not None or self._raw_data is not None:
+            self._populate_data_tab()
+            self._reselect_listbox(self._data_listbox, self._data_labels(),
+                                   old_idx, self._on_data_select)
+        if self._sma_result is not None:
+            self._populate_analysis_tab()
+            self._reselect_listbox(self._sma_listbox,
+                                   self._sma_result.get('sample_labels', []),
+                                   old_idx, self._an_on_select)
+        self._refresh_toolbar()
+
+    @staticmethod
+    def _reselect_listbox(listbox: tk.Listbox, labels: list,
+                          idx: int, on_select) -> None:
+        """Select *idx* (clamped) in *listbox* and fire its selection callback."""
+        if not labels:
+            return
+        new_idx = min(idx, len(labels) - 1)
+        listbox.selection_clear(0, tk.END)
+        listbox.selection_set(new_idx)
+        listbox.see(new_idx)
+        on_select()
 
     def _load_folder_raw(self, fdir: str) -> None:
         """Load single-beam spectra from a folder; display immediately without running emcal."""
@@ -2256,6 +2474,20 @@ class EmissionLWIR(tk.Tk):
         finally:
             self._refresh_toolbar()
 
+    @staticmethod
+    def _sanitize_suffix(raw: str) -> str:
+        """
+        Clean a user-entered filename suffix, or return '' if unusable.
+
+        Strips surrounding whitespace, replaces path separators with '_' so the
+        suffix cannot escape the target folder, and drops leading dots so it
+        cannot produce a hidden file. An empty result signals "use a timestamp".
+        """
+        cleaned = raw.strip().replace(os.sep, '_')
+        if os.altsep:
+            cleaned = cleaned.replace(os.altsep, '_')
+        return cleaned.lstrip('.').strip()
+
     def _on_save_results(self) -> None:
         # Determine parent output directory
         if self._fdir:
@@ -2263,17 +2495,21 @@ class EmissionLWIR(tk.Tk):
         elif self._fdirs:
             out_dir = str(Path(self._fdirs[0]).parent)
         else:
-            out_dir = filedialog.askdirectory(title='Choose folder to save results')
+            out_dir = filedialog.askdirectory(
+                title='Choose folder to save results',
+                initialdir=self._last_load_dir or os.getcwd())
             if not out_dir:
                 return
 
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        # Filename suffix: user-entered value if present, else a timestamp.
+        suffix = (self._sanitize_suffix(self._suffix_var.get())
+                  or datetime.now().strftime('%Y%m%d_%H%M%S'))
         saved:  list[str] = []
         errors: list[str] = []
 
         def _save_emcal(result: dict, folder: str, label: str = '') -> None:
             tag = f' ({label})' if label else ''
-            hdf_path = os.path.join(folder, f'emcal_results_{timestamp}.hdf')
+            hdf_path = os.path.join(folder, f'emcal_results_{suffix}.hdf')
             csv_path = hdf_path.replace('.hdf', '.csv')
             try:
                 saveHDF(result, hdf_path)
@@ -2291,7 +2527,7 @@ class EmissionLWIR(tk.Tk):
                 logging.exception("Failed to save emcal CSV%s", tag)
 
         def _save_sma(result: dict, folder: str) -> None:
-            hdf_path = os.path.join(folder, f'sma_results_{timestamp}.hdf')
+            hdf_path = os.path.join(folder, f'sma_results_{suffix}.hdf')
             csv_path = hdf_path.replace('.hdf', '.csv')
             try:
                 saveHDF(result, hdf_path)
@@ -2318,7 +2554,7 @@ class EmissionLWIR(tk.Tk):
         if self._fdirs and self._individual_calrad_results:
             for fdir, ind_result in zip(self._fdirs, self._individual_calrad_results):
                 folder_name = Path(fdir).name
-                hdf_path = os.path.join(fdir, f'calrad_results_{timestamp}.hdf')
+                hdf_path = os.path.join(fdir, f'calrad_results_{suffix}.hdf')
                 try:
                     saveHDF(ind_result, hdf_path)
                     saved.append(hdf_path)

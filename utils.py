@@ -922,7 +922,15 @@ def saveHDF(data: dict, fname: str) -> None:
                 grp = h5_group.require_group(skey)
                 _write_group(grp, val)
             elif isinstance(val, np.ndarray):
-                h5_group.create_dataset(skey, data=val)
+                # h5py cannot write fixed-width unicode ('<U…') arrays directly;
+                # encode them as a UTF-8 string dataset (readHDF decodes back).
+                if val.dtype.kind == 'U':
+                    encoded = np.array([s.encode('utf-8') for s in val.ravel()])
+                    h5_group.create_dataset(
+                        skey, data=encoded.reshape(val.shape),
+                        dtype=h5py.string_dtype(encoding='utf-8'))
+                else:
+                    h5_group.create_dataset(skey, data=val)
             elif isinstance(val, str):
                 h5_group.create_dataset(skey, data=val.encode('utf-8'))
             elif isinstance(val, (int, float, np.integer, np.floating)):
