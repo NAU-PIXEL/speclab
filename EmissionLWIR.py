@@ -1259,7 +1259,7 @@ class EmissionLWIR(tk.Tk):
         lf.pack(fill=tk.BOTH, expand=True, padx=4, pady=2)
         sb = ttk.Scrollbar(lf, orient=tk.VERTICAL)
         self._data_listbox = tk.Listbox(
-            lf, yscrollcommand=sb.set, selectmode=tk.SINGLE, exportselection=False,
+            lf, yscrollcommand=sb.set, selectmode=tk.EXTENDED, exportselection=False,
             font=('TkFixedFont', 13))
         sb.config(command=self._data_listbox.yview)
         self._data_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -1316,8 +1316,9 @@ class EmissionLWIR(tk.Tk):
 
         ttk.Separator(ctrl, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
         self._btn_data_delete = ttk.Button(
-            ctrl, text='Delete spectrum', state=tk.DISABLED,
-            command=lambda: self._on_delete_sample(self._data_label))
+            ctrl, text='Delete spectrum(s)', state=tk.DISABLED,
+            command=lambda: self._on_delete_sample(
+                self._data_selected_labels() or [self._data_label]))
         self._btn_data_delete.pack(fill=tk.X)
 
         # Right: nav bar + plot + info panel
@@ -1390,7 +1391,7 @@ class EmissionLWIR(tk.Tk):
         lf.pack(fill=tk.BOTH, expand=True, padx=4, pady=2)
         sb = ttk.Scrollbar(lf, orient=tk.VERTICAL)
         self._sl_listbox = tk.Listbox(
-            lf, yscrollcommand=sb.set, selectmode=tk.SINGLE,
+            lf, yscrollcommand=sb.set, selectmode=tk.EXTENDED,
             exportselection=False, font=('TkFixedFont', 13))
         sb.config(command=self._sl_listbox.yview)
         self._sl_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -1593,6 +1594,8 @@ class EmissionLWIR(tk.Tk):
                         value='individual', command=plot_cmd).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Radiobutton(bar, text='Stacked', variable=plot_var,
                         value='stacked', command=plot_cmd).pack(side=tk.LEFT, padx=2)
+        ttk.Radiobutton(bar, text='Selected', variable=plot_var,
+                        value='selected', command=plot_cmd).pack(side=tk.LEFT, padx=2)
         ttk.Button(bar, text='▶', width=3, command=next_cmd).pack(side=tk.RIGHT)
 
         label_var = tk.StringVar(value='')
@@ -1956,44 +1959,59 @@ class EmissionLWIR(tk.Tk):
             except Exception:
                 logging.warning("Could not drop '%s' from raw notes table", label)
 
-    def _on_delete_sample(self, label: str | None) -> None:
-        """Delete a spectrum from every loaded in-memory result and refresh the GUI."""
-        if not label:
+    def _on_delete_sample(self, labels) -> None:
+        """Delete one or more spectra from every loaded in-memory result and refresh."""
+        if isinstance(labels, str):
+            labels = [labels]
+        # Normalise: drop empties, dedupe (preserve order).
+        seen: set = set()
+        labels = [str(l) for l in (labels or [])
+                  if l and not (str(l) in seen or seen.add(str(l)))]
+
+        emcal_labels = ([str(s) for s in self._emcal_result.get('label', [])]
+                        if self._emcal_result is not None else [])
+        sma_labels   = ([str(s) for s in self._sma_result.get('sample_labels', [])]
+                        if self._sma_result is not None else [])
+        present = set(emcal_labels) | set(sma_labels)
+        labels  = [l for l in labels if l in present]
+        if not labels:
             return
 
-        in_emcal = (self._emcal_result is not None
-                    and label in [str(s) for s in self._emcal_result.get('label', [])])
-        in_sma   = (self._sma_result is not None
-                    and label in [str(s) for s in self._sma_result.get('sample_labels', [])])
-        if not (in_emcal or in_sma):
-            return
-
+        n = len(labels)
+        if n == 1:
+            body = f'Remove "{labels[0]}" from the loaded results?'
+        else:
+            shown = '\n'.join(f'  • {l}' for l in labels[:12])
+            more  = f'\n  … and {n - 12} more' if n > 12 else ''
+            body  = f'Remove these {n} spectra from the loaded results?\n\n{shown}{more}'
         if not messagebox.askyesno(
-            'Delete spectrum',
-            f'Remove "{label}" from the loaded results?\n\n'
-            'This edits the in-memory results only — the source file on disk is '
-            'not changed. Use "Save Results" to write a reduced copy.',
+            'Delete spectra',
+            f'{body}\n\nThis edits the in-memory results only — the source file on '
+            'disk is not changed. Use "Save Results" to write a reduced copy.',
             icon='warning',
         ):
             return
 
-        # Record the position so we can reselect a neighbour after repopulating.
-        ref_labels = (self._emcal_result.get('label', []) if in_emcal
-                      else self._sma_result.get('sample_labels', []))
-        old_idx = [str(s) for s in ref_labels].index(label)
+        # Reselect near the earliest deleted position after repopulating.
+        ref_labels = emcal_labels or sma_labels
+        old_idx = min((ref_labels.index(l) for l in labels if l in ref_labels),
+                      default=0)
 
-        if in_emcal:
-            self._delete_sample_emcal(self._emcal_result, label)
-        if in_sma:
-            self._delete_sample_sma(self._sma_result, label)
-        if self._raw_data is not None:
-            self._delete_sample_raw(self._raw_data, label)
-        if self._pristine_emiss is not None:
-            self._pristine_emiss.pop(label, None)
+        for label in labels:
+            if self._emcal_result is not None and label in [
+                    str(s) for s in self._emcal_result.get('label', [])]:
+                self._delete_sample_emcal(self._emcal_result, label)
+            if self._sma_result is not None and label in [
+                    str(s) for s in self._sma_result.get('sample_labels', [])]:
+                self._delete_sample_sma(self._sma_result, label)
+            if self._raw_data is not None:
+                self._delete_sample_raw(self._raw_data, label)
+            if self._pristine_emiss is not None:
+                self._pristine_emiss.pop(label, None)
 
         self._data_label = None
         self._sma_label  = None
-        logging.info("Deleted sample '%s'", label)
+        logging.info("Deleted %d sample(s): %s", n, ', '.join(labels))
 
         if self._emcal_result is not None or self._raw_data is not None:
             self._populate_data_tab()
@@ -2789,9 +2807,9 @@ class EmissionLWIR(tk.Tk):
         self._data_listbox.delete(0, tk.END)
         for lbl in labels:
             self._data_listbox.insert(tk.END, lbl)
-        if labels:
-            self._data_listbox.selection_set(0)
-            self._data_label = labels[0]
+        # Start with nothing selected → Stacked mode shows a plain, unemphasised view.
+        self._data_listbox.selection_clear(0, tk.END)
+        self._data_label = None
         self._refresh_data_plot()
         self._refresh_info_tree()
         self._update_metrics_button()
@@ -2842,7 +2860,14 @@ class EmissionLWIR(tk.Tk):
             return self._raw_data.get('labels', [])
         return []
 
+    def _data_selected_labels(self) -> list[str]:
+        """Labels currently highlighted in the Data listbox (multi-selection)."""
+        labels = self._data_labels()
+        return [labels[i] for i in self._data_listbox.curselection() if i < len(labels)]
+
     def _data_navigate(self, delta: int) -> None:
+        if self._data_plot_var.get() == 'selected':
+            return
         labels = self._data_labels()
         if not labels or self._data_label is None:
             return
@@ -2876,13 +2901,30 @@ class EmissionLWIR(tk.Tk):
     def _update_data_nav_label(self) -> None:
         labels  = self._data_labels()
         n_total = len(labels)
-        if self._data_plot_var.get() == 'individual':
+        mode_p  = self._data_plot_var.get()
+        if mode_p == 'individual':
             text = self._data_label or ''
+        elif mode_p == 'selected':
+            k    = len(self._data_selected_labels())
+            text = f'{k} selected of {n_total}' if n_total else ''
         else:
             start = self._data_page * _PAGE_SIZE + 1
             end   = min(start + _PAGE_SIZE - 1, n_total)
             text  = f'Spectra {start}–{end} of {n_total}' if n_total else ''
         self._data_nav_label.set(text)
+
+    @staticmethod
+    def _stack_emphasis(key, selset: set) -> tuple:
+        """(linewidth, alpha, zorder) for a stacked-plot line, emphasising the selection.
+
+        With no selection every line is drawn normally; otherwise selected lines
+        are thick/opaque/on-top and the rest are thin/faded.
+        """
+        if not selset:
+            return 0.8, 1.0, 2
+        if key in selset:
+            return 1.8, 1.0, 3
+        return 0.7, 0.35, 1
 
     def _refresh_data_plot(self) -> None:
         if self._data_secax is not None:
@@ -2998,19 +3040,28 @@ class EmissionLWIR(tk.Tk):
                     rad0 = rad0 - (1.0 - max_emiss) * dw
             return rad0
 
-        if plot == 'stacked':
-            start     = self._data_page * _PAGE_SIZE
-            page_lbls = labels[start:start + _PAGE_SIZE]
+        if plot in ('stacked', 'selected'):
+            if plot == 'selected':
+                page_lbls = self._data_selected_labels()
+                selset: set = set()   # all shown are selected → uniform weight
+            else:
+                start     = self._data_page * _PAGE_SIZE
+                page_lbls = labels[start:start + _PAGE_SIZE]
+                selset    = set(self._data_selected_labels())   # emphasise these
             for i, lbl in enumerate(page_lbls):
                 col = colors[i % len(colors)]
+                lw, alpha, z = self._stack_emphasis(lbl, selset)
                 if lbl in spectra:
-                    ax.plot(wn, spectra[lbl], label=lbl, color=col, lw=0.8)
+                    ax.plot(wn, spectra[lbl], label=lbl, color=col,
+                            lw=lw, alpha=alpha, zorder=z)
                 if show_model_fit:
                     rad0 = _model_overlay(lbl)
                     if rad0 is not None:
-                        ax.plot(wn, rad0, color=col, ls='--', lw=0.7, alpha=0.6)
+                        ax.plot(wn, rad0, color=col, ls='--', lw=0.7,
+                                alpha=0.6 * alpha, zorder=z)
             _plot_bbs(lw=1.2)
-            ax.legend(fontsize=7, loc='upper right')
+            if page_lbls:
+                ax.legend(fontsize=7, loc='upper right')
         else:
             lbl = self._data_label
             if lbl and lbl in spectra:
@@ -3368,6 +3419,11 @@ class EmissionLWIR(tk.Tk):
             self._active_sid = self._filtered_ids[idx]
             self._sl_refresh_plot()
 
+    def _sl_selected_ids(self) -> list:
+        """spec_ids currently highlighted in the Speclib listbox (multi-selection)."""
+        return [self._filtered_ids[i] for i in self._sl_listbox.curselection()
+                if i < len(self._filtered_ids)]
+
     def _sl_update_status(self) -> None:
         n = len(self._browse_source)
         if self._sl_lib_path:
@@ -3389,39 +3445,42 @@ class EmissionLWIR(tk.Tk):
         self._sl_em_status.config(text=' | '.join(parts))
 
     def _sl_toggle_excluded(self) -> None:
-        sel = self._sl_listbox.curselection()
-        if not sel or sel[0] >= len(self._filtered_ids):
+        sids = self._sl_selected_ids()
+        if not sids:
             return
-        sid = self._filtered_ids[sel[0]]
-        if sid in self._excluded_sids:
-            self._excluded_sids.discard(sid)
+        # Uniform toggle: if all selected are already excluded, clear them; else exclude all.
+        if all(sid in self._excluded_sids for sid in sids):
+            for sid in sids:
+                self._excluded_sids.discard(sid)
         else:
-            self._excluded_sids.add(sid)
-            self._forced_sids.discard(sid)
+            for sid in sids:
+                self._excluded_sids.add(sid)
+                self._forced_sids.discard(sid)
         self._sl_populate_listbox()
 
     def _sl_toggle_forced(self) -> None:
-        sel = self._sl_listbox.curselection()
-        if not sel or sel[0] >= len(self._filtered_ids):
+        sids = self._sl_selected_ids()
+        if not sids:
             return
-        sid = self._filtered_ids[sel[0]]
-        if sid in self._forced_sids:
-            self._forced_sids.discard(sid)
+        if all(sid in self._forced_sids for sid in sids):
+            for sid in sids:
+                self._forced_sids.discard(sid)
         else:
-            self._forced_sids.add(sid)
-            self._excluded_sids.discard(sid)
+            for sid in sids:
+                self._forced_sids.add(sid)
+                self._excluded_sids.discard(sid)
         self._sl_populate_listbox()
 
     def _sl_remove_spectrum(self) -> None:
-        sel = self._sl_listbox.curselection()
-        if not sel or sel[0] >= len(self._filtered_ids):
+        sids = self._sl_selected_ids()
+        if not sids:
             return
-        sid = self._filtered_ids[sel[0]]
-        for store in (self._full_library, self._current_album, self._extra_libs):
-            if sid in store:
-                del store[sid]
-        self._excluded_sids.discard(sid)
-        self._forced_sids.discard(sid)
+        for sid in sids:
+            for store in (self._full_library, self._current_album, self._extra_libs):
+                if sid in store:
+                    del store[sid]
+            self._excluded_sids.discard(sid)
+            self._forced_sids.discard(sid)
         self._sl_populate_listbox()
         self._sl_update_status()
 
@@ -3443,6 +3502,8 @@ class EmissionLWIR(tk.Tk):
             self._sl_navigate(1)
 
     def _sl_navigate(self, delta: int) -> None:
+        if self._sl_plot_var.get() == 'selected':
+            return
         if not self._filtered_ids or self._active_sid is None:
             return
         try:
@@ -3459,12 +3520,15 @@ class EmissionLWIR(tk.Tk):
 
     def _update_sl_nav_label(self) -> None:
         n_total = len(self._filtered_ids)
-        if self._sl_plot_var.get() == 'individual':
+        mode_p  = self._sl_plot_var.get()
+        if mode_p == 'individual':
             if self._active_sid is not None:
                 entry = self._browse_source.get(self._active_sid, {})
                 text  = entry.get('sample_name', str(self._active_sid))
             else:
                 text = ''
+        elif mode_p == 'selected':
+            text = f'{len(self._sl_selected_ids())} selected of {n_total}' if n_total else ''
         else:
             start = self._sl_page * _PAGE_SIZE + 1
             end   = min(start + _PAGE_SIZE - 1, n_total)
@@ -3494,9 +3558,14 @@ class EmissionLWIR(tk.Tk):
                         '#aaaaaa' if self._active_sid in self._excluded_sids else 'tab:red'
                 ax.plot(xaxis, data, color=color, lw=1.2)
                 ax.set_title(label, fontsize=10)
-        elif mode == 'stacked':
-            start = self._sl_page * _PAGE_SIZE
-            page_ids = self._filtered_ids[start:start + _PAGE_SIZE]
+        elif mode in ('stacked', 'selected'):
+            if mode == 'selected':
+                page_ids = self._sl_selected_ids()
+                selset: set = set()   # all shown are selected → uniform weight
+            else:
+                start = self._sl_page * _PAGE_SIZE
+                page_ids = self._filtered_ids[start:start + _PAGE_SIZE]
+                selset   = set(self._sl_selected_ids())   # emphasise these
             for i, sid in enumerate(page_ids):
                 entry = self._browse_source.get(sid)
                 if entry is None:
@@ -3506,7 +3575,9 @@ class EmissionLWIR(tk.Tk):
                 label = entry.get('sample_name', str(sid))
                 color = '#aaaaaa' if sid in self._excluded_sids else \
                         '#c0392b' if sid in self._forced_sids else colors[i % len(colors)]
-                ax.plot(xaxis, data, label=label, color=color, lw=0.8)
+                lw, alpha, z = self._stack_emphasis(sid, selset)
+                ax.plot(xaxis, data, label=label, color=color,
+                        lw=lw, alpha=alpha, zorder=z)
             if page_ids:
                 ax.legend(fontsize=7, loc='upper right')
 
