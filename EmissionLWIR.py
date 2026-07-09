@@ -3400,20 +3400,6 @@ class EmissionLWIR(tk.Tk):
             return dict(foreground='#27ae60')   # green
         return {}
 
-    def _sl_navigate(self, delta: int) -> None:
-        lb = self._sl_listbox
-        n  = lb.size()
-        if n == 0:
-            return
-        sel = lb.curselection()
-        cur = sel[0] if sel else 0
-        new_idx = max(0, min(n - 1, cur + delta))
-        if new_idx != cur:
-            lb.selection_clear(0, tk.END)
-            lb.selection_set(new_idx)
-            lb.see(new_idx)
-            self._sl_on_select()
-
     def _sl_on_select(self, _event=None) -> None:
         sel = self._sl_listbox.curselection()
         if not sel:
