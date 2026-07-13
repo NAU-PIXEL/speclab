@@ -119,6 +119,12 @@ def findFiles(
         regex = re.compile(fnmatch.translate(pattern), re.IGNORECASE)
         for root, _, files in os.walk(fdir):
             for file in files:
+                # Skip macOS AppleDouble sidecars (e.g. "._name.csv"): binary
+                # resource-fork metadata written next to real files on non-native
+                # volumes.  They match data globs like "*.csv" but are not text,
+                # and persist on the drive across OSes (also seen on Windows).
+                if file.startswith('._'):
+                    continue
                 path = os.path.join(root, file)
                 if regex.match(file) and path not in matching_files:
                     matching_files.append(path)

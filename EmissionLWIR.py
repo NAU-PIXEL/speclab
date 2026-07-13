@@ -2136,15 +2136,26 @@ class EmissionLWIR(tk.Tk):
         def _worker() -> None:
             try:
                 results = []
+                skipped: list[tuple[str, str]] = []
                 for fdir in fdirs:
-                    r = load_sbm(fdir)
+                    # Skip and warn on folders that fail to load so the rest of
+                    # the batch still loads; only hard-fail if none succeed.
+                    try:
+                        r = load_sbm(fdir)
+                    except Exception as exc:
+                        logging.error("Skipping folder %s: %s", fdir, exc)
+                        skipped.append((Path(fdir).name, str(exc)))
+                        continue
                     try:
                         notes_df, _ = readEmissionCSVnotes(fdir, return_path=True)
                         r['notes'] = notes_df
                     except Exception:
                         r['notes'] = None
                     results.append(r)
-                self.after(0, self._on_load_folders_raw_done, results)
+                if not results:
+                    detail = '\n'.join(f"  {name}: {err}" for name, err in skipped)
+                    raise IOError(f"No folders could be loaded.\n{detail}")
+                self.after(0, self._on_load_folders_raw_done, results, skipped)
             except Exception as exc:
                 import traceback
                 msg = traceback.format_exc()
@@ -2156,7 +2167,11 @@ class EmissionLWIR(tk.Tk):
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _on_load_folders_raw_done(self, results: list[dict]) -> None:
+    def _on_load_folders_raw_done(
+        self,
+        results: list[dict],
+        skipped: list[tuple[str, str]] | None = None,
+    ) -> None:
         """Merge per-folder load_sbm results and display in SBM mode."""
         import pandas as pd
 
@@ -2216,6 +2231,14 @@ class EmissionLWIR(tk.Tk):
         self._data_mode = 'sbm'
         self._populate_data_tab()
         self._refresh_toolbar()
+
+        if skipped:
+            detail = '\n'.join(f"  • {name}: {err}" for name, err in skipped)
+            logging.warning("Skipped %d folder(s):\n%s", len(skipped), detail)
+            messagebox.showwarning(
+                'Some folders skipped',
+                f"Loaded {len(results)} folder(s); skipped {len(skipped)}:\n\n{detail}",
+            )
 
     def _on_load_library(self) -> None:
         lib_dir = get_config().get('spectral_libraries_dir') or str(Path(__file__).parent / 'spectral_libraries')

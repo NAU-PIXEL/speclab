@@ -1042,16 +1042,34 @@ def load_sbm(
     labels: list[str] = []
     sbm: dict[str, np.ndarray] = {}
     xaxis: np.ndarray | None = None
+    skipped: list[str] = []
 
     for fname in flist:
-        spec  = utils.readOMNIC(fname)
         label = os.path.splitext(os.path.basename(fname))[0]
+        # Skip and warn on files that are not readable two-column spectra
+        # (e.g. cloud-sync "conflicted copy" notes files that slip past the
+        # exclusion filters) so one bad file does not abort the whole folder.
+        try:
+            spec = utils.readOMNIC(fname)
+        except Exception as exc:
+            skipped.append(label)
+            logging.warning("load_sbm: skipping unreadable file '%s' (%s)",
+                            os.path.basename(fname), exc)
+            continue
         if xaxis is None:
             xaxis = spec['wn']
         elif len(spec['wn']) != len(xaxis) or not np.all(spec['wn'] == xaxis):
-            raise IOError(f"Wavenumber axis mismatch for sample: {label}")
+            skipped.append(label)
+            logging.warning("load_sbm: skipping '%s' (wavenumber axis mismatch)", label)
+            continue
         labels.append(label)
         sbm[label] = spec['data']
+
+    if not labels:
+        raise IOError(f"No readable sample spectra found in {fdir}")
+    if skipped:
+        logging.warning("load_sbm: skipped %d file(s) in %s: %s",
+                        len(skipped), fdir, ', '.join(skipped))
 
     return {'xaxis': xaxis, 'sbm': sbm, 'label': labels, 'fdir': fdir}
 
@@ -5133,6 +5151,35 @@ def _merge_per_entry(dicts: list) -> dict:
     return merged
 
 
+def _sync_label_with_spectra(merged: dict) -> None:
+    """
+    Rebuild the ``label`` key in-place to match the merged spectral sub-dicts.
+
+    Merging combines the label-keyed sub-dicts (``emiss``, ``rad``, …) by
+    suffixing name collisions (``_2``, ``_3``, …), so the surviving set of
+    sample labels is the *keys* of those sub-dicts — not the original ``label``
+    vector, which may have been deduplicated (when inputs share identical
+    label arrays) or carried over from a single input.  The GUI and downstream
+    consumers enumerate samples via ``label`` and look each one up in ``emiss``,
+    so the two must stay consistent.  The first present spectral sub-dict, in
+    priority order, defines the canonical sample list and ordering.
+
+    Parameters
+    ----------
+    merged : dict
+        Merged measurement dict, modified in place.  No-op if it carries no
+        recognised spectral sub-dict.
+    """
+    for key in ('emiss', 'rad', 'sbm', 'rad0'):
+        sub = merged.get(key)
+        if isinstance(sub, dict) and sub:
+            # Keep 'label' a plain list to match emcal/load_sbm output; GUI and
+            # other consumers index, slice, and truth-test it (an ndarray would
+            # raise "truth value of an array is ambiguous" on `if labels:`).
+            merged['label'] = [str(k) for k in sub.keys()]
+            return
+
+
 def _merge_measurement(dicts: list, resample: bool = False) -> dict:
     """
     Merge measurement-format (emcal3-style) dicts.
@@ -5198,26 +5245,41 @@ def _merge_measurement(dicts: list, resample: bool = False) -> dict:
                             "keeping input 1's calib.", i
                         )
             elif key == 'notes':
-                # notes is a column-keyed dict of parallel lists — concatenate each column
+                # notes is a column-keyed dict of parallel sequences — concatenate
+                # each column across inputs.  Columns may be Python lists or NumPy
+                # arrays, so coerce to list before concatenating (summing raw arrays
+                # would trigger element-wise broadcasting instead of concatenation).
                 cols: set[str] = set()
                 for v in values:
                     cols.update(v.keys())
                 merged[key] = {
-                    col: sum((v.get(col, []) for v in values), [])
+                    col: [item for v in values for item in list(v.get(col, []))]
                     for col in sorted(cols)
                 }
             else:
                 merged[key] = _merge_sub_dicts(values, key)
 
         elif isinstance(first, np.ndarray):
-            # Identical across all inputs → shared axis; otherwise stack
-            all_equal = all(
-                v.shape == first.shape and np.allclose(v, first, equal_nan=True)
-                for v in values[1:]
-            )
+            # Identical across all inputs → shared axis; otherwise stack.
+            # Numeric arrays are compared with a tolerance; non-numeric arrays
+            # (e.g. string labels) fall back to exact element-wise equality
+            # since np.allclose cannot promote strings to a float tolerance.
+            def _arrays_match(v: np.ndarray, ref: np.ndarray) -> bool:
+                if v.shape != ref.shape:
+                    return False
+                if v.dtype.kind in 'fc' and ref.dtype.kind in 'fc':
+                    return bool(np.allclose(v, ref, equal_nan=True))
+                return bool(np.array_equal(v, ref))
+
+            all_equal = all(_arrays_match(v, first) for v in values[1:])
             if all_equal:
                 merged[key] = first
+            elif first.ndim == 1:
+                # Per-sample 1-D vectors (e.g. 'label') — concatenate end-to-end
+                # so differing lengths across inputs are joined, not row-stacked.
+                merged[key] = np.concatenate(values, axis=0)
             else:
+                # 2-D+ sample matrices (n_spectra × n_channels) — stack rows.
                 try:
                     merged[key] = np.concatenate(
                         [np.atleast_2d(v) for v in values], axis=0
@@ -5232,7 +5294,7 @@ def _merge_measurement(dicts: list, resample: bool = False) -> dict:
             # Concatenate lists (e.g. the 'label' key from emcal output)
             merged[key] = sum(values, [])
 
-        elif isinstance(first, (int, float, str, bytes)):
+        elif isinstance(first, (int, float, str, bytes, np.generic)):
             if not all(v == first for v in values[1:]):
                 logging.warning(
                     "merge: scalar key '%s' differs across inputs — keeping first value (%r).",
@@ -5246,6 +5308,7 @@ def _merge_measurement(dicts: list, resample: bool = False) -> dict:
             )
             merged[key] = first
 
+    _sync_label_with_spectra(merged)
     return merged
 
 
@@ -5467,6 +5530,7 @@ def _merge_spectral_union(dicts: list, align_overlap: bool = True) -> dict:
                     "input 1 — skipped.", key, i,
                 )
 
+    _sync_label_with_spectra(merged)
     return merged
 
 
