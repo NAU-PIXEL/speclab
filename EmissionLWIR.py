@@ -17,7 +17,7 @@ import os
 import logging
 import threading
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 from pathlib import Path
 from datetime import datetime
 
@@ -696,6 +696,142 @@ class FolderSelectDialog(tk.Toplevel):
 
 
 # ---------------------------------------------------------------------------
+# Merge dialog
+# ---------------------------------------------------------------------------
+
+class MergeDialog(tk.Toplevel):
+    """
+    Modal dialog to merge existing emcal result files — optionally with the
+    dataset already loaded in the session — vertically (add samples on a common
+    range) or horizontally (extend the spectral range for shared samples).
+
+    On OK, ``result`` is a dict with keys ``files`` (list[str]),
+    ``include_current`` (bool), ``how`` ('auto'|'vertical'|'horizontal'),
+    ``resample`` (bool), and ``align_overlap`` (bool); ``None`` if cancelled.
+    """
+
+    def __init__(self, master: tk.Misc, initial_files: list[str] | None = None,
+                 has_current: bool = False) -> None:
+        super().__init__(master)
+        self.title('Load & Merge Results')
+        self.resizable(True, True)
+        self.grab_set()
+        self.transient(master)
+        self.result: dict | None = None
+
+        self._files: list[str] = list(initial_files or [])
+        self._has_current = has_current
+        self._build()
+        self.wait_window(self)
+
+    def _build(self) -> None:
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        lf = ttk.LabelFrame(frm, text='Files to merge', padding=4)
+        lf.pack(fill=tk.BOTH, expand=True)
+        sb = ttk.Scrollbar(lf, orient=tk.VERTICAL)
+        self._lb = tk.Listbox(lf, height=6, yscrollcommand=sb.set,
+                              font=('TkFixedFont', 11), activestyle='dotbox',
+                              exportselection=False)
+        sb.config(command=self._lb.yview)
+        self._lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._refresh_file_list()
+
+        fr = ttk.Frame(frm)
+        fr.pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(fr, text='Add files…', command=self._add_files).pack(side=tk.LEFT, padx=2)
+        ttk.Button(fr, text='Remove selected',
+                   command=self._remove_selected).pack(side=tk.LEFT, padx=2)
+
+        self._include_current = tk.BooleanVar(value=False)
+        cb = ttk.Checkbutton(
+            frm, text='Include currently-loaded dataset',
+            variable=self._include_current)
+        cb.pack(anchor=tk.W, pady=(6, 0))
+        if not self._has_current:
+            cb.state(['disabled'])
+
+        dirf = ttk.LabelFrame(frm, text='Direction', padding=4)
+        dirf.pack(fill=tk.X, pady=(8, 0))
+        self._how = tk.StringVar(value='auto')
+        for val, txt in (
+            ('auto',       'Auto-detect'),
+            ('vertical',   'Vertical — add samples (same spectral range)'),
+            ('horizontal', 'Horizontal — extend range (shared samples)'),
+        ):
+            ttk.Radiobutton(dirf, text=txt, variable=self._how, value=val,
+                            command=self._sync_opt_state).pack(anchor=tk.W)
+
+        optf = ttk.Frame(frm)
+        optf.pack(fill=tk.X, pady=(6, 0))
+        self._resample = tk.BooleanVar(value=True)
+        self._align    = tk.BooleanVar(value=True)
+        self._cb_resample = ttk.Checkbutton(
+            optf, text='Resample to common range (vertical, differing axes)',
+            variable=self._resample)
+        self._cb_resample.pack(anchor=tk.W)
+        self._cb_align = ttk.Checkbutton(
+            optf, text='Align overlap DC offset (horizontal)',
+            variable=self._align)
+        self._cb_align.pack(anchor=tk.W)
+        self._sync_opt_state()
+
+        bf = ttk.Frame(frm)
+        bf.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(bf, text='Merge',  command=self._ok).pack(side=tk.LEFT, padx=4)
+        ttk.Button(bf, text='Cancel', command=self.destroy).pack(side=tk.LEFT, padx=4)
+
+        self.geometry('540x460')
+
+    def _refresh_file_list(self) -> None:
+        self._lb.delete(0, tk.END)
+        for p in self._files:
+            self._lb.insert(tk.END, os.path.basename(p))
+
+    def _add_files(self) -> None:
+        paths = filedialog.askopenfilenames(
+            title='Select result files to merge',
+            filetypes=[('HDF files', '*.hdf *.h5'), ('All files', '*')],
+            parent=self,
+        )
+        for p in paths:
+            if p not in self._files:
+                self._files.append(p)
+        self._refresh_file_list()
+
+    def _remove_selected(self) -> None:
+        for i in reversed(self._lb.curselection()):
+            del self._files[i]
+        self._refresh_file_list()
+
+    def _sync_opt_state(self) -> None:
+        how = self._how.get()
+        self._cb_resample.state(
+            ['!disabled'] if how in ('auto', 'vertical') else ['disabled'])
+        self._cb_align.state(
+            ['!disabled'] if how in ('auto', 'horizontal') else ['disabled'])
+
+    def _ok(self) -> None:
+        n_inputs = len(self._files) + (1 if self._include_current.get() else 0)
+        if n_inputs < 2:
+            messagebox.showwarning(
+                'Need two inputs',
+                'Select at least two datasets to merge (files, plus optionally '
+                'the currently-loaded dataset).', parent=self)
+            return
+        self.result = {
+            'files':         list(self._files),
+            'include_current': bool(self._include_current.get()),
+            'how':           self._how.get(),
+            'resample':      bool(self._resample.get()),
+            'align_overlap': bool(self._align.get()),
+        }
+        self.destroy()
+
+
+# ---------------------------------------------------------------------------
 # Axis Limits dialog
 # ---------------------------------------------------------------------------
 
@@ -1141,6 +1277,10 @@ class EmissionLWIR(tk.Tk):
             row1, text='Load Results', command=self._on_load_results)
         self._btn_load_results.pack(side=tk.LEFT, padx=2)
 
+        self._btn_load_merge = ttk.Button(
+            row1, text='Load & Merge', command=self._on_load_and_merge)
+        self._btn_load_merge.pack(side=tk.LEFT, padx=2)
+
         ttk.Separator(row1, orient=tk.VERTICAL).pack(
             side=tk.LEFT, fill=tk.Y, padx=6, pady=2)
 
@@ -1219,6 +1359,10 @@ class EmissionLWIR(tk.Tk):
         self._rb_em['state']  = _state(have_emiss)
         self._btn_data_delete['state'] = _state(have_emcal or self._raw_data is not None)
         self._btn_an_delete['state']   = _state(have_sma)
+        # Rename is only meaningful once a result is processed (label→file join
+        # no longer needed); disabled for the raw SBM-only folder load.
+        self._btn_data_rename['state'] = _state(have_emcal)
+        self._btn_an_rename['state']   = _state(have_sma)
         self._smooth_spin['state'] = _state(self._pristine_emiss is not None)
         in_radiance = have_calrad and self._data_mode_var.get() == 'radiance'
         self._cb_show_model['state']  = _state(in_radiance)
@@ -1321,6 +1465,11 @@ class EmissionLWIR(tk.Tk):
             command=lambda: self._on_delete_sample(
                 self._data_selected_labels() or [self._data_label]))
         self._btn_data_delete.pack(fill=tk.X)
+        self._btn_data_rename = ttk.Button(
+            ctrl, text='Rename spectrum', state=tk.DISABLED,
+            command=lambda: self._on_rename_sample(
+                (self._data_selected_labels() or [self._data_label])[0]))
+        self._btn_data_rename.pack(fill=tk.X)
 
         # Right: nav bar + plot + info panel
         right = ttk.Frame(paned)
@@ -1486,6 +1635,10 @@ class EmissionLWIR(tk.Tk):
             bf, text='Delete spectrum', state=tk.DISABLED,
             command=lambda: self._on_delete_sample(self._sma_label))
         self._btn_an_delete.pack(fill=tk.X, pady=1)
+        self._btn_an_rename = ttk.Button(
+            bf, text='Rename spectrum', state=tk.DISABLED,
+            command=lambda: self._on_rename_sample(self._sma_label))
+        self._btn_an_rename.pack(fill=tk.X, pady=1)
 
         # Right: nav/opts bar spanning full width, then figure | pie+table
         right = ttk.Frame(paned)
@@ -1697,7 +1850,7 @@ class EmissionLWIR(tk.Tk):
 
     def _on_load_results(self) -> None:
         paths = filedialog.askopenfilenames(
-            title='Load Results  (select multiple TES files to merge)',
+            title='Load Results  (select multiple emcal or TES files to merge)',
             filetypes=[('HDF files', '*.hdf *.h5'), ('All files', '*')],
         )
         if not paths:
@@ -1738,31 +1891,127 @@ class EmissionLWIR(tk.Tk):
                          len(tes_dicts), len(merged.get('label', [])))
             return
 
-        # Standard result files: single-file only.
-        if len(other) != 1:
+        # Standard result files: single → dispatch; multiple → vertical merge.
+        if len(parsed) == 1:
+            path, d = parsed[0]
+            self._dispatch_result(path, d)
+            return
+
+        kinds = {self._detect_result_kind(p, d) for p, d in parsed}
+        if kinds - {'emcal', 'emiss_array'}:
             messagebox.showwarning(
                 'Multiple files',
-                'Multi-select is only supported for TES files. Select a single '
-                'emcal or sma result file.')
+                'Multi-select merge supports emcal result files only.  For sma '
+                'results load a single file, or use "Load & Merge" for '
+                'controlled merges.')
             return
-        path, d = parsed[0]
-        self._dispatch_result(path, d)
+        # Multi-select intent is unambiguously "stack these" — force vertical
+        # (resampled to the common range) rather than rely on auto-detection.
+        self._merge_and_load([d for _, d in parsed], how='vertical',
+                             resample=True, n_src=len(parsed))
+
+    def _on_load_and_merge(self) -> None:
+        """Merge a fresh set of emcal result files (optionally with the loaded
+        dataset) via the Merge dialog, then load the result."""
+        paths = filedialog.askopenfilenames(
+            title='Select result files to merge',
+            filetypes=[('HDF files', '*.hdf *.h5'), ('All files', '*')],
+        )
+        has_current = self._emcal_result is not None
+        if not paths and not has_current:
+            return
+
+        dlg = MergeDialog(self, initial_files=list(paths), has_current=has_current)
+        if dlg.result is None:
+            return
+        opts = dlg.result
+
+        dicts:  list[dict] = []
+        for p in opts['files']:
+            try:
+                d = readHDF(p)
+            except Exception as exc:
+                messagebox.showerror('Load failed', f'{os.path.basename(p)}: {exc}')
+                logging.exception("readHDF failed for %s", p)
+                return
+            if self._detect_result_kind(p, d) not in ('emcal', 'emiss_array'):
+                messagebox.showerror(
+                    'Unsupported file',
+                    f'{os.path.basename(p)} is not an emcal result.  Merge '
+                    'currently supports emcal results only.')
+                return
+            dicts.append(d)
+
+        # Current dataset goes first so it is the DC reference for horizontal merges.
+        if opts['include_current'] and self._emcal_result is not None:
+            dicts.insert(0, self._emcal_result)
+
+        if len(dicts) < 2:
+            messagebox.showwarning(
+                'Need two inputs', 'Select at least two datasets to merge.')
+            return
+
+        self._merge_and_load(dicts, how=opts['how'], resample=opts['resample'],
+                             align_overlap=opts['align_overlap'], n_src=len(dicts))
+
+    @staticmethod
+    def _detect_result_kind(path: str, d: dict) -> str | None:
+        """
+        Classify a standard result dict as ``'emcal'``, ``'sma'``, or
+        ``'emiss_array'`` from its filename then content, or ``None`` when the
+        type cannot be determined non-interactively.
+        """
+        basename = os.path.basename(path)
+        if 'emcal_results' in basename:
+            return 'emcal'
+        if 'sma_results' in basename:
+            return 'sma'
+        if 'method' in d:
+            return 'emcal'
+        if 'algorithm' in d:
+            return 'sma'
+        if 'data' in d and 'xaxis' in d and 'label' in d:
+            return 'emiss_array'
+        return None
+
+    def _merge_and_load(self, dicts: list[dict], how: str = 'auto',
+                        resample: bool = False, align_overlap: bool = True,
+                        n_src: int | None = None) -> bool:
+        """
+        Merge measurement dicts and load the result into the Data tab.
+
+        Labels are coerced to plain lists before merging — a mix of ``list`` and
+        ``ndarray`` label containers across inputs breaks the measurement
+        merge's concatenation (see the merge label-type contract) — and the
+        merged result is routed through :meth:`_load_emcal_result`, which
+        re-coerces the label.  Returns ``True`` on success.
+        """
+        for d in dicts:
+            if 'label' in d and hasattr(d['label'], 'tolist'):
+                d['label'] = [str(s) for s in d['label']]
+        try:
+            merged = merge(*dicts, how=how, resample=resample,
+                           align_overlap=align_overlap)
+        except (ValueError, TypeError) as exc:
+            messagebox.showerror('Merge failed', str(exc))
+            logging.exception("merge failed")
+            return False
+
+        self._load_emcal_result(merged)
+        n   = len(self._emcal_result.get('label', []))
+        nwn = len(np.asarray(self._emcal_result.get('xaxis', [])))
+        n_src = n_src if n_src is not None else len(dicts)
+        logging.info("Merged %d datasets → %d spectra × %d channels (how=%s)",
+                     n_src, n, nwn, how)
+        messagebox.showinfo(
+            'Merge complete',
+            f'Merged {n_src} datasets ({how}) → {n} spectra × {nwn} channels.')
+        return True
 
     def _dispatch_result(self, path: str, d: dict) -> None:
         """Detect a standard result file's type and route it to the loader."""
-        # Detect result type — filename first, content fallback, user prompt last
-        basename = os.path.basename(path)
-        if 'emcal_results' in basename:
-            kind = 'emcal'
-        elif 'sma_results' in basename:
-            kind = 'sma'
-        elif 'method' in d:
-            kind = 'emcal'
-        elif 'algorithm' in d:
-            kind = 'sma'
-        elif 'data' in d and 'xaxis' in d and 'label' in d:
-            kind = 'emiss_array'
-        else:
+        kind = self._detect_result_kind(path, d)
+        if kind is None:
             ans = messagebox.askquestion(
                 'Ambiguous file',
                 'Cannot determine result type from filename or content.\n\n'
@@ -2039,6 +2288,155 @@ class EmissionLWIR(tk.Tk):
         listbox.selection_set(new_idx)
         listbox.see(new_idx)
         on_select()
+
+    # -----------------------------------------------------------------------
+    # Sample renaming (post-processing only)
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _replace_label_entry(container: object, old: str, new: str) -> object:
+        """
+        Replace the first occurrence of *old* with *new* in a label container.
+
+        Handles Python lists (mutated in place, so shared references stay in
+        sync) and NumPy arrays (returned as an ``object`` dtype copy to avoid
+        the fixed-width string truncation a longer name would otherwise hit).
+        Any other type, or an absent *old*, is returned unchanged.
+        """
+        if isinstance(container, list):
+            labels = [str(s) for s in container]
+            if old in labels:
+                container[labels.index(old)] = new
+            return container
+        if isinstance(container, np.ndarray):
+            labels = [str(s) for s in container]
+            if old in labels:
+                out = container.astype(object)
+                out[labels.index(old)] = new
+                return out
+        return container
+
+    @staticmethod
+    def _rename_sample_emcal(d: dict, old: str, new: str) -> None:
+        """
+        Rename sample *old* → *new* in-place in an emcal-style result dict.
+
+        Replaces the entry in ``label`` and moves *old*'s value to *new* in
+        every label-keyed sub-dict. Positional arrays (``data``) and the
+        row-aligned embedded ``notes`` table stay aligned and need no change.
+        """
+        d['label'] = EmissionLWIR._replace_label_entry(d.get('label'), old, new)
+        for key in _EMCAL_SAMPLE_DICTS:
+            sub = d.get(key)
+            if isinstance(sub, dict) and old in sub:
+                sub[new] = sub.pop(old)
+
+    @staticmethod
+    def _rename_sample_sma(d: dict, old: str, new: str) -> None:
+        """Rename sample *old* → *new* in-place in an sma-style result dict.
+
+        Only ``sample_labels`` carries the sample identity; every other
+        per-sample array is positional, so nothing else needs touching.
+        """
+        d['sample_labels'] = EmissionLWIR._replace_label_entry(
+            d.get('sample_labels'), old, new)
+
+    @staticmethod
+    def _rename_sample_raw(raw: dict, old: str, new: str) -> None:
+        """Rename sample *old* → *new* in-place in a reconstructed raw-data dict."""
+        raw['labels'] = EmissionLWIR._replace_label_entry(
+            raw.get('labels'), old, new)
+        for key in ('sbm', 'radiance', 'emissivity'):
+            sub = raw.get(key)
+            if isinstance(sub, dict) and old in sub:
+                sub[new] = sub.pop(old)
+        notes = raw.get('notes')
+        if notes is not None and hasattr(notes, 'loc'):
+            try:
+                notes.loc[notes['sample_name'] == old, 'sample_name'] = new
+            except Exception:
+                logging.warning("Could not rename '%s' in raw notes table", old)
+
+    def _sync_notes_rename(self, old: str, new: str) -> None:
+        """
+        Rename *old* → *new* in the on-disk measurement-info table (in memory)
+        so the Measurement Info panel follows the new name. Best-effort: for a
+        shared result HDF with no source folder the table stays ``None`` and
+        this is a no-op.
+        """
+        if self._notes_df is None:
+            self._ensure_notes()
+        if self._notes_df is not None:
+            try:
+                self._notes_df.loc[
+                    self._notes_df['sample_name'] == old, 'sample_name'] = new
+            except Exception:
+                logging.warning("Could not rename '%s' in notes table", old)
+
+    def _on_rename_sample(self, old_label) -> None:
+        """Rename a single spectrum across every loaded in-memory result.
+
+        Available only once a processed result (emcal or sma) is loaded — the
+        label→file relationship is no longer needed post-emcal, so the label
+        becomes a freely editable display name.
+        """
+        if not old_label:
+            return
+        old_label = str(old_label)
+
+        emcal_labels = ([str(s) for s in self._emcal_result.get('label', [])]
+                        if self._emcal_result is not None else [])
+        sma_labels   = ([str(s) for s in self._sma_result.get('sample_labels', [])]
+                        if self._sma_result is not None else [])
+        present = set(emcal_labels) | set(sma_labels)
+        if old_label not in present:
+            return
+
+        new_label = simpledialog.askstring(
+            'Rename spectrum',
+            'New name for this spectrum:',
+            initialvalue=old_label,
+            parent=self,
+        )
+        if new_label is None:
+            return
+        new_label = new_label.strip()
+        if not new_label or new_label == old_label:
+            return
+        if new_label in present:
+            messagebox.showerror(
+                'Rename spectrum',
+                f'A spectrum named "{new_label}" already exists.\n'
+                'Choose a different name.',
+            )
+            return
+
+        ref_labels = emcal_labels or sma_labels
+        idx = ref_labels.index(old_label) if old_label in ref_labels else 0
+
+        if self._emcal_result is not None and old_label in emcal_labels:
+            self._rename_sample_emcal(self._emcal_result, old_label, new_label)
+        if self._sma_result is not None and old_label in sma_labels:
+            self._rename_sample_sma(self._sma_result, old_label, new_label)
+        if self._raw_data is not None:
+            self._rename_sample_raw(self._raw_data, old_label, new_label)
+        if self._pristine_emiss is not None and old_label in self._pristine_emiss:
+            self._pristine_emiss[new_label] = self._pristine_emiss.pop(old_label)
+        self._sync_notes_rename(old_label, new_label)
+
+        self._data_label = None
+        self._sma_label  = None
+        logging.info("Renamed sample '%s' → '%s'", old_label, new_label)
+
+        if self._emcal_result is not None or self._raw_data is not None:
+            self._populate_data_tab()
+            self._reselect_listbox(self._data_listbox, self._data_labels(),
+                                   idx, self._on_data_select)
+        if self._sma_result is not None:
+            self._populate_analysis_tab()
+            self._reselect_listbox(self._sma_listbox,
+                                   self._sma_result.get('sample_labels', []),
+                                   idx, self._an_on_select)
 
     def _load_folder_raw(self, fdir: str) -> None:
         """Load single-beam spectra from a folder; display immediately without running emcal."""

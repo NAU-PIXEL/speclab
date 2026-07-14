@@ -5356,10 +5356,14 @@ def _detect_merge_direction(dicts: list, how: str) -> str:
             "intersection, or verify that the inputs are correct."
         )
 
-    # Look for shared sample labels across any spectral sub-dict
+    # Look for shared sample labels across any spectral sub-dict.  Blackbody
+    # entries ('bbc'/'bbh') live alongside samples in 'rad'/'sbm' but are not
+    # samples — excluding them prevents two vertically-stackable runs (disjoint
+    # samples, shared BBs) from being misread as a horizontal merge.
+    _bb_keys = {'bbc', 'bbh'}
     for key in ('emiss', 'rad', 'sbm', 'rad0'):
         label_sets = [
-            set(d[key].keys())
+            set(d[key].keys()) - _bb_keys
             for d in dicts
             if isinstance(d.get(key), dict)
         ]
@@ -5516,8 +5520,11 @@ def _merge_spectral_union(dicts: list, align_overlap: bool = True) -> dict:
                 merged_sub[label] = np.nanmean(np.vstack(stacks), axis=0)
         merged[sub_key] = merged_sub
 
-    # Pass through non-spectral keys from the first input
-    _skip = {'xaxis', 'wl'} | set(_SPECTRAL_KEYS)
+    # Pass through non-spectral keys from the first input.  ``notes`` is
+    # deliberately dropped: the embedded measurement-info table is row-aligned
+    # to a single input's sample order and would be left inconsistent with the
+    # merged union label set, so a horizontal merge carries no notes.
+    _skip = {'xaxis', 'wl', 'notes'} | set(_SPECTRAL_KEYS)
     for key, val in dicts[0].items():
         if key not in _skip:
             merged[key] = val
