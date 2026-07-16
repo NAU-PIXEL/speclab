@@ -229,8 +229,9 @@ class BBTempsDialog(tk.Toplevel):
 
         ttk.Label(
             frm,
-            text='No measurement info file found.\n'
-                 'Enter blackbody temperatures.',
+            text='Blackbody temperatures could not be read from the '
+                 'measurement info\n(no info file found, or BB resistance '
+                 'values are missing/NaN).\nEnter blackbody temperatures below.',
             foreground='#c05000',
             justify=tk.LEFT,
             wraplength=340,
@@ -2484,9 +2485,10 @@ class EmissionLWIR(tk.Tk):
             note_flist = []
 
         previous = findFiles(['emcal', 'results'], '.csv', fdir)
+        log_flist = findFiles(['live-log'], '.csv', fdir)  # AutomateFTIR run log — not a spectrum
         flist = findFiles("", '.csv', fdir)
         flist = [f for f in flist
-                 if f not in bbc_flist + bbh_flist + note_flist + previous]
+                 if f not in bbc_flist + bbh_flist + note_flist + previous + log_flist]
         flist.sort()
 
         sbm: dict[str, np.ndarray] = {}
