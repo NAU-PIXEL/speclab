@@ -5523,8 +5523,12 @@ def _merge_spectral_union(dicts: list, align_overlap: bool = True) -> dict:
     # Pass through non-spectral keys from the first input.  ``notes`` is
     # deliberately dropped: the embedded measurement-info table is row-aligned
     # to a single input's sample order and would be left inconsistent with the
-    # merged union label set, so a horizontal merge carries no notes.
-    _skip = {'xaxis', 'wl', 'notes'} | set(_SPECTRAL_KEYS)
+    # merged union label set, so a horizontal merge carries no notes.  ``data``
+    # is dropped here and rebuilt below: it is the stacked-emissivity matrix on
+    # a single input's (pre-union) axis, so passing it through would leave it
+    # inconsistent with the union ``xaxis``/``emiss`` (the source of the
+    # observed 285-vs-286-band merge failures).
+    _skip = {'xaxis', 'wl', 'notes', 'data'} | set(_SPECTRAL_KEYS)
     for key, val in dicts[0].items():
         if key not in _skip:
             merged[key] = val
@@ -5536,6 +5540,12 @@ def _merge_spectral_union(dicts: list, align_overlap: bool = True) -> dict:
                     "merge (horizontal): key '%s' in input %d absent from "
                     "input 1 — skipped.", key, i,
                 )
+
+    # Rebuild the derived 'data' matrix from the merged 'emiss' (on the union
+    # xaxis, in label order) when any input carried one, so 'data' never drifts
+    # from 'emiss'/'xaxis'.
+    if any('data' in d for d in dicts) and isinstance(merged.get('emiss'), dict) and merged['emiss']:
+        merged['data'] = np.stack([np.asarray(v) for v in merged['emiss'].values()])
 
     _sync_label_with_spectra(merged)
     return merged
@@ -5706,6 +5716,56 @@ def read_tes(path: str) -> dict:
     }
 
 
+def _validate_internal_consistency(dicts: list) -> None:
+    """
+    Raise if any measurement input's spectral arrays disagree with its own axis.
+
+    Checks that each input's ``data`` matrix and every ``emiss``/``rad``/
+    ``rad0``/``sbm`` spectrum has a band count matching ``len(xaxis)``.  Catches
+    malformed inputs — e.g. a stale ``data`` matrix left over from an older
+    merge — up front with an actionable message, instead of failing later with
+    an opaque ``np.interp`` "fp and xp are not of the same length" error during
+    resampling.
+
+    Parameters
+    ----------
+    dicts : list of dict
+        Measurement-format input dicts (each carrying an ``xaxis``).
+
+    Raises
+    ------
+    ValueError
+        On the first input whose ``data`` or a spectral sub-dict entry has a
+        band count differing from that input's ``xaxis`` length.
+    """
+    for i, d in enumerate(dicts, start=1):
+        if not isinstance(d, dict) or 'xaxis' not in d:
+            continue
+        n = int(np.asarray(d['xaxis']).shape[-1])
+
+        data = d.get('data')
+        if isinstance(data, np.ndarray) and data.ndim in (1, 2) and data.shape[-1] != n:
+            raise ValueError(
+                f"merge: input {i} is internally inconsistent — 'data' has "
+                f"{data.shape[-1]} bands but 'xaxis' has {n}. This file is "
+                f"malformed (likely a stale 'data' array from an older merge); "
+                f"regenerate it before merging."
+            )
+
+        for key in ('emiss', 'rad', 'rad0', 'sbm'):
+            sub = d.get(key)
+            if not isinstance(sub, dict):
+                continue
+            for lbl, arr in sub.items():
+                a = np.asarray(arr)
+                if a.ndim == 1 and a.shape[0] != n:
+                    raise ValueError(
+                        f"merge: input {i} is internally inconsistent — "
+                        f"'{key}[{lbl}]' has {a.shape[0]} bands but 'xaxis' has "
+                        f"{n}. This file is malformed; regenerate it before merging."
+                    )
+
+
 def merge(
     *inputs,
     how: str = 'auto',
@@ -5814,6 +5874,11 @@ def merge(
             f"found {set(types)}."
         )
     dtype = types[0]
+
+    # Fail fast on internally-inconsistent inputs with a clear diagnostic,
+    # rather than an opaque interp/length error deep in the resampling.
+    if dtype != 'per_entry':
+        _validate_internal_consistency(dicts)
 
     # Dispatch
     if dtype == 'per_entry':

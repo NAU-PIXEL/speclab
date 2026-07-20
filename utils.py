@@ -1798,19 +1798,52 @@ def _to_album(raw: dict) -> dict:
     if 'xaxis' in raw and 'data' in raw and not isinstance(raw['data'], dict):
         data_val = raw['data']
         if isinstance(data_val, np.ndarray) and data_val.ndim >= 2:
-            return _flat__to_album(raw)
-        return {0: {k: v for k, v in raw.items()}}
-
-    if all(isinstance(v, dict) for v in raw.values()):
+            album = _flat__to_album(raw)
+        else:
+            album = {0: {k: v for k, v in raw.items()}}
+    elif all(isinstance(v, dict) for v in raw.values()):
         first = next(iter(raw.values()))
         if 'xaxis' in first and 'data' in first and np.ndim(first['data']) == 2:
-            return _grouped_sv_to_album(raw)
-        return _per_spectrum_to_album(raw)
+            album = _grouped_sv_to_album(raw)
+        else:
+            album = _per_spectrum_to_album(raw)
+    else:
+        raise ValueError(
+            "_to_album: unrecognised spectral library layout — "
+            f"top-level keys: {list(raw.keys())[:8]}"
+        )
 
-    raise ValueError(
-        "_to_album: unrecognised spectral library layout — "
-        f"top-level keys: {list(raw.keys())[:8]}"
-    )
+    _backfill_sample_name(album)
+    return album
+
+
+def _backfill_sample_name(album: dict) -> None:
+    """
+    Ensure every album entry has a ``sample_name`` for display, in place.
+
+    Album consumers (the browse listbox, plot labels, sma endmember names) read
+    the per-spectrum display name from ``sample_name``.  Some sources — notably
+    emcal result dicts — carry names under ``label`` instead, so their spectra
+    would otherwise fall back to sequential integer ids.  Backfill
+    ``sample_name`` from ``label`` (or ``name``) when it is absent; existing
+    ``sample_name`` values are left untouched.
+
+    Parameters
+    ----------
+    album : dict
+        Album dict ``{id: {field: value}}``, modified in place.
+    """
+    for entry in album.values():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get('sample_name') not in (None, ''):
+            continue
+        name = entry.get('label')
+        if name is None:
+            name = entry.get('name')
+        # Only adopt a scalar name; skip array-valued fields defensively.
+        if name is not None and np.ndim(name) == 0:
+            entry['sample_name'] = str(name)
 
 
 def save_tracal_csv(out: dict, fname: str) -> None:
