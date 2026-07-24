@@ -1767,6 +1767,80 @@ def _per_spectrum_to_album(raw: dict) -> dict:
     return album
 
 
+def is_emcal_result(d: dict) -> bool:
+    """
+    Return ``True`` if *d* looks like an emcal (emissivity calibration) result.
+
+    Signature check on the keys emcal always emits, regardless of method
+    (nem/mmd/alpha/hullfit): a scalar ``method``, the label-keyed ``emiss``
+    sub-dict, and ``max_emiss``.  Method-specific keys (e.g.
+    ``sample_t_wavenumber``) are deliberately excluded so the check stays
+    method-agnostic.  Distinct from sma (``algorithm``) and cal_rad (no
+    ``method``/``emiss``).
+
+    Parameters
+    ----------
+    d : dict
+        Dict as returned by :func:`readHDF`.
+
+    Returns
+    -------
+    bool
+        ``True`` when *d* carries the emcal signature.
+    """
+    return (isinstance(d, dict)
+            and 'method' in d
+            and isinstance(d.get('emiss'), dict)
+            and 'max_emiss' in d)
+
+
+def _emcal_to_album(raw: dict) -> dict:
+    """
+    Convert an emcal result dict to a per-spectrum album keyed by label.
+
+    Builds one entry per ``emiss`` spectrum — the authoritative emissivity
+    data, matching how the Results view renders emcal output — so the album is
+    complete and correctly named even when the redundant top-level ``data``
+    matrix is stale.  BB spectra (present in ``rad``/``sbm`` but not ``emiss``)
+    are naturally excluded.  Useful per-sample scalars are attached; the bulk
+    sub-dicts (``rad``, ``sbm``, ``rad0``, ``emiss_full``, ``calib``, ``notes``)
+    are dropped.
+
+    Parameters
+    ----------
+    raw : dict
+        emcal result dict (see :func:`is_emcal_result`).
+
+    Returns
+    -------
+    dict
+        Album dict ``{i: {'data', 'xaxis', 'sample_name', ...}}`` with
+        sequential integer keys starting at 0.
+    """
+    xaxis      = np.asarray(raw['xaxis'], dtype=np.float64)
+    emiss      = raw['emiss']
+    temps      = raw.get('sample_temps', {})
+    t_wn       = raw.get('sample_t_wavenumber', {})
+    method     = _native_scalar(raw.get('method'))
+    max_emiss  = _native_scalar(raw.get('max_emiss'))
+
+    album: dict = {}
+    for i, (label, spec) in enumerate(emiss.items()):
+        entry: dict = {
+            'data':        np.asarray(spec, dtype=np.float64),
+            'xaxis':       xaxis,
+            'sample_name': str(label),
+            'method':      method,
+            'max_emiss':   max_emiss,
+        }
+        if isinstance(temps, dict) and label in temps:
+            entry['sample_temp'] = _native_scalar(temps[label])
+        if isinstance(t_wn, dict) and label in t_wn:
+            entry['sample_t_wavenumber'] = _native_scalar(t_wn[label])
+        album[i] = entry
+    return album
+
+
 def _to_album(raw: dict) -> dict:
     """
     Convert the output of :func:`readHDF` to the per-spectrum album dict
@@ -1795,7 +1869,14 @@ def _to_album(raw: dict) -> dict:
     ValueError
         If the layout cannot be recognised.
     """
-    if 'xaxis' in raw and 'data' in raw and not isinstance(raw['data'], dict):
+    # emcal results carry the authoritative emissivity spectra in the 'emiss'
+    # sub-dict (keyed by label), matching how the Results view displays them.
+    # Build the album from 'emiss' rather than the top-level 'data' matrix,
+    # which is a derived/stackable copy that can be stale (wrong sample count
+    # or band count) in files produced by older merges.
+    if is_emcal_result(raw):
+        album = _emcal_to_album(raw)
+    elif 'xaxis' in raw and 'data' in raw and not isinstance(raw['data'], dict):
         data_val = raw['data']
         if isinstance(data_val, np.ndarray) and data_val.ndim >= 2:
             album = _flat__to_album(raw)

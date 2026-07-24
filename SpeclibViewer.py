@@ -55,7 +55,7 @@ if __package__ is None:
     __package__ = 'speclab'
 
 from .functions import resample_spectrum, load_instrument_grids, insert_plot_gaps
-from .utils import readHDF, saveHDF, _set_window_size
+from .utils import readHDF, saveHDF, _set_window_size, is_emcal_result, _emcal_to_album
 from .config import get_config
 from . import __version__
 
@@ -137,6 +137,13 @@ def _load_hdf(path: str) -> dict:
         If the loaded dict does not match either recognised layout.
     """
     raw = readHDF(path, collapse=False)
+
+    # emcal results carry their spectra in the label-keyed 'emiss' sub-dict.
+    # Build the album from that (via the shared converter) rather than the
+    # top-level 'data' matrix, which is a derived copy that can be stale
+    # (wrong sample/band count) in files produced by older merges.
+    if is_emcal_result(raw):
+        return _emcal_to_album(raw)
 
     def _expand_group(grp: dict, start_id: int, album: dict) -> int:
         """Expand a grouped sub-dict (shared xaxis + 2-D data) into album."""
