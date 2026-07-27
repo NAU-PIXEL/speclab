@@ -1409,6 +1409,9 @@ class AutomateFTIR(tk.Tk):
         ttk.Button(
             btn_row, text='Browse…', command=self._on_browse_folder,
         ).pack(side=tk.RIGHT, padx=(4, 0))
+        ttk.Button(
+            btn_row, text='Load…', command=self._on_load_session,
+        ).pack(side=tk.RIGHT, padx=(0, 2))
         ttk.Entry(
             btn_row,
             textvariable=self._save_fdir_var,
@@ -2522,6 +2525,246 @@ class AutomateFTIR(tk.Tk):
         self._display_var.set('sbm')
         self._redraw_plot()
         self._check_processing_buttons()
+
+    # -----------------------------------------------------------------------
+    # Load session
+    # -----------------------------------------------------------------------
+
+    def _on_load_session(self) -> None:
+        """Button handler: pick a folder and reload spectra from it."""
+        if self._collection_active:
+            messagebox.showwarning('Busy', 'A collection is in progress.')
+            return
+        if self._has_session_data():
+            n    = len(self._spectra_data)
+            noun = 'spectrum' if n == 1 else 'spectra'
+            if not messagebox.askyesno(
+                'Load session?',
+                f'You have {n} {noun} in memory.\n\n'
+                'Loading a session will clear the current data.\n\nProceed?',
+                icon='warning',
+                default='no',
+            ):
+                return
+        _init = self._save_fdir or Path.home()
+        chosen = filedialog.askdirectory(
+            title='Select session folder to load',
+            initialdir=str(_init),
+        )
+        if not chosen:
+            return
+        self._load_session_from_folder(Path(chosen))
+
+    def _load_session_from_folder(self, folder: Path) -> None:
+        """Main thread: read measurement-info CSV, switch mode, launch loader thread.
+
+        Sets the save folder and spectrum counter unconditionally so that new
+        collections after loading append to the existing data correctly.
+
+        Parameters
+        ----------
+        folder : Path
+            Session folder chosen by the user.
+        """
+        self._save_fdir = folder
+        self._save_fdir_var.set(str(folder))
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logging.warning("Could not create session folder: %s", exc)
+
+        csv_path = folder / f'{folder.name}-measurement-info.csv'
+        if not csv_path.exists():
+            # No measurement-info — treat as a plain Browse (no spectra to load).
+            self._spectrum_count = 0
+            self._clear_session_data()
+            self._refresh_buttons()
+            self._check_processing_buttons()
+            self._status_var.set('Folder set — no measurement-info found, starting fresh')
+            logging.info("Load: no measurement-info in %s — starting fresh", folder)
+            return
+
+        # Read all rows from measurement-info.
+        try:
+            with open(csv_path, 'r', newline='') as fh:
+                rows = list(csv.DictReader(fh))
+        except Exception as exc:
+            messagebox.showerror(
+                'Load failed',
+                f'Could not read measurement-info:\n{exc}')
+            logging.error("Load: could not read %s: %s", csv_path, exc)
+            return
+
+        if not rows:
+            self._spectrum_count = 0
+            self._clear_session_data()
+            self._refresh_buttons()
+            self._status_var.set('Folder set — measurement-info is empty')
+            logging.info("Load: measurement-info empty in %s", folder)
+            return
+
+        # ── Determine mode from first row and switch silently ───────────────
+        mode = rows[0].get('mode', self._mode_var.get()) or self._mode_var.get()
+        if mode != self._mode_var.get():
+            self._mode_var.set(mode)
+            self._last_mode = mode
+            self._exp_files = _scan_exp_files(mode)
+            default = _MODE_EXP_DEFAULTS.get(mode, DEFAULT_EXP_FILENAME)
+            self._exp_file_var.set(
+                default if default in self._exp_files else self._exp_files[0])
+            self._cb_exp.config(values=self._exp_files)
+
+        # ── Set spectrum counter so new spectra don't reuse existing numbers ─
+        try:
+            nums = [int(r['spectrum_number']) for r in rows
+                    if r.get('spectrum_number', '').strip().lstrip('-').isdigit()]
+            self._spectrum_count = (max(nums) + 1) if nums else len(rows)
+        except Exception:
+            self._spectrum_count = len(rows)
+
+        # ── Clear in-memory state before loading ────────────────────────────
+        self._clear_session_data()
+        self._refresh_buttons()
+
+        n = len(rows)
+        self._status_var.set(f'Loading {n} spectrum/spectra…')
+        logging.info("Load: starting — %d rows in %s", n, csv_path)
+
+        threading.Thread(
+            target=self._load_session_worker,
+            args=(folder, rows),
+            daemon=True,
+        ).start()
+
+    def _parse_mm_stats_from_row(self, row: dict) -> dict[int, dict]:
+        """Reconstruct per-channel mm_stats from a measurement-info CSV row.
+
+        Returns a dict in the same format produced by ``_compute_mm_stats``:
+        ``{ch: {'mean': float, 'std': float, 'min': float, 'max': float, 'n': int}}``.
+        Missing or blank values are stored as empty string, matching the
+        convention used for non-Emission rows.
+
+        Parameters
+        ----------
+        row : dict
+            One row from csv.DictReader over the measurement-info CSV.
+
+        Returns
+        -------
+        dict[int, dict]
+        """
+        stats: dict[int, dict] = {}
+        for ch in _PANEL_ORDER:
+            mean_raw = row.get(f'channel_{ch}', '').strip()
+            std_raw  = row.get(f'channel_{ch}_std', '').strip()
+            min_raw  = row.get(f'channel_{ch}_min', '').strip()
+            max_raw  = row.get(f'channel_{ch}_max', '').strip()
+
+            def _f(s: str) -> 'float | str':
+                try:
+                    return float(s)
+                except (ValueError, TypeError):
+                    return ''
+
+            mean = _f(mean_raw)
+            std  = _f(std_raw)
+            mn   = _f(min_raw)
+            mx   = _f(max_raw)
+            n    = 1 if isinstance(mean, float) else 0
+            stats[ch] = {
+                'mean': mean,
+                'std':  std  if isinstance(std, float)  else 0.0,
+                'min':  mn   if isinstance(mn,  float)  else '',
+                'max':  mx   if isinstance(mx,  float)  else '',
+                'n':    n,
+            }
+        return stats
+
+    def _load_session_worker(self, folder: Path, rows: list[dict]) -> None:
+        """Background thread: read each spectrum CSV and collect results.
+
+        Posts a single batch callback to the main thread when done so the
+        listbox and plot are updated in one pass.
+
+        Parameters
+        ----------
+        folder : Path
+            Session folder (contains the ``.CSV`` spectrum files).
+        rows : list of dict
+            Rows from the measurement-info CSV, in order.
+        """
+        loaded:   list[tuple] = []   # (name, spectrum, mm_stats, is_bb, is_bkg, is_blank, mode)
+        n_missing = 0
+
+        for row in rows:
+            name = row.get('sample_name', '').strip()
+            if not name:
+                continue
+            csv_file = folder / f'{name}.CSV'
+            if not csv_file.exists():
+                logging.warning("Load: spectrum file not found, skipping: %s", csv_file)
+                n_missing += 1
+                continue
+            try:
+                spectrum = readOMNIC(str(csv_file))
+                mm_stats = self._parse_mm_stats_from_row(row)
+                is_bb    = bool(int(row.get('is_bb',    '0') or '0'))
+                is_bkg   = bool(int(row.get('is_bkg',   '0') or '0'))
+                is_blank = bool(int(row.get('is_blank', '0') or '0'))
+                mode     = row.get('mode', self._mode_var.get()) or self._mode_var.get()
+                loaded.append((name, spectrum, mm_stats, is_bb, is_bkg, is_blank, mode))
+            except Exception as exc:
+                logging.error("Load: failed to read %s: %s", csv_file, exc)
+                n_missing += 1
+
+        self.after(
+            0,
+            lambda l=loaded, nm=n_missing: self._on_load_batch(l, nm),
+        )
+
+    def _on_load_batch(
+        self,
+        loaded: 'list[tuple]',
+        n_missing: int,
+    ) -> None:
+        """Main thread: insert all loaded spectra, redraw once, report result.
+
+        Parameters
+        ----------
+        loaded : list of tuple
+            Each element: ``(name, spectrum, mm_stats, is_bb, is_bkg, is_blank, mode)``.
+        n_missing : int
+            Number of spectrum files that were absent from the folder.
+        """
+        for name, spectrum, mm_stats, is_bb, is_bkg, is_blank, mode in loaded:
+            if name not in self._spectra_data:
+                self._spectra_lb.insert(tk.END, name)
+            self._spectra_data[name] = {
+                **spectrum,
+                'mm_stats': mm_stats,
+                'is_bb':    is_bb,
+                'is_bkg':   is_bkg,
+                'is_blank': is_blank,
+                'mode':     mode,
+            }
+            # Restore the background reference used by tracal() / refcal().
+            # Only the last bkg row is kept (matching normal collection behaviour).
+            if is_bkg:
+                self._bkg_spectrum = spectrum
+
+        n_loaded = len(loaded)
+        self._check_processing_buttons()
+        self._refresh_buttons()
+        self._redraw_plot()
+
+        if n_missing:
+            msg = (f'Loaded {n_loaded} spectrum/spectra; '
+                   f'{n_missing} file(s) not found and skipped.')
+            messagebox.showwarning('Load incomplete', msg)
+        status = (f'Session loaded — {n_loaded} spectrum/spectra'
+                  + (f' ({n_missing} missing)' if n_missing else ''))
+        self._status_var.set(status)
+        logging.info("Load complete — %d loaded, %d missing", n_loaded, n_missing)
 
     def _on_browse_folder(self) -> None:
         """Open a directory chooser, update the save path, and init the spectrum count."""
