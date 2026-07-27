@@ -35,3 +35,7 @@ debug/wards_comparison/
 
 # OS
 .DS_Store
+
+# Docs in progress — un-ignore and commit these with v1.0.0
+AutomateFTIR_User_Manual.docx
+CLAUDE.md
