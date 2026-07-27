@@ -13,6 +13,10 @@ build/
 .vscode/
 .claude/
 
+# Logs
+*.log
+*.log.*
+
 # Data / outputs
 *.hdf
 !spectral_libraries/*.hdf
