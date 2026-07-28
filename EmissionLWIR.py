@@ -2782,7 +2782,13 @@ class EmissionLWIR(tk.Tk):
 
                 self.after(0, self._status_var.set,
                            f'{parent_name}  |  Merging {n_total} results ...')
-                merged = merge(*results, resample=True)
+                # Multi-folder batch always stacks disjoint samples from separate
+                # folders onto a common axis — an unambiguously vertical merge.
+                # Each folder's SBM mask trims a different set of low-wavenumber
+                # channels, so output axes differ; resample onto their intersection.
+                # State the direction explicitly rather than relying on auto-detection,
+                # which cannot infer it (differing axes + no shared labels).
+                merged = merge(*results, how='vertical', resample=True)
                 logging.info("merge() complete — %d samples total",
                              len(merged.get('label', [])))
                 self.after(0, self._on_cal_rad_done, results, merged)
@@ -2955,7 +2961,13 @@ class EmissionLWIR(tk.Tk):
 
                 self.after(0, self._status_var.set,
                            f'{parent_name}  |  Merging {n_total} results ...')
-                merged = merge(*results, resample=True)
+                # Multi-folder batch always stacks disjoint samples from separate
+                # folders onto a common axis — an unambiguously vertical merge.
+                # Each folder's SBM mask trims a different set of low-wavenumber
+                # channels, so output axes differ; resample onto their intersection.
+                # State the direction explicitly rather than relying on auto-detection,
+                # which cannot infer it (differing axes + no shared labels).
+                merged = merge(*results, how='vertical', resample=True)
                 n_merged = len(merged.get('sample_labels', merged.get('label', [])))
                 logging.info("merge() complete — %d samples total", n_merged)
                 self.after(0, self._on_emcal_multi_done, results, merged)
