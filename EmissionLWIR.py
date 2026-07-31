@@ -2009,6 +2009,25 @@ class EmissionLWIR(tk.Tk):
             f'Merged {n_src} datasets ({how}) → {n} spectra × {nwn} channels.')
         return True
 
+    @staticmethod
+    def _as_str_list(x) -> list:
+        """
+        Coerce a label container to a plain ``list[str]``.
+
+        ``readHDF`` collapses a single-element string array to a bare scalar
+        (``'Greywacke'`` rather than ``['Greywacke']``); iterating over that
+        scalar would split it into individual characters.  This normalises
+        scalars, bytes, ndarrays and lists to a list of Python strings.
+        """
+        if x is None:
+            return []
+        if isinstance(x, bytes):
+            return [x.decode()]
+        if isinstance(x, str):
+            return [x]
+        arr = np.atleast_1d(np.asarray(x, dtype=object)).ravel()
+        return [s.decode() if isinstance(s, bytes) else str(s) for s in arr]
+
     def _dispatch_result(self, path: str, d: dict) -> None:
         """Detect a standard result file's type and route it to the loader."""
         kind = self._detect_result_kind(path, d)
@@ -2029,8 +2048,12 @@ class EmissionLWIR(tk.Tk):
             self._load_emiss_array(d)
 
     def _load_emcal_result(self, d: dict) -> None:
-        if 'label' in d and hasattr(d['label'], 'tolist'):
-            d['label'] = [str(s) for s in d['label']]
+        if 'label' in d:
+            d['label'] = self._as_str_list(d['label'])
+        # Single-sample files collapse (1, n_wn) arrays to (n_wn,) on read;
+        # restore the leading sample axis so per-sample indexing stays valid.
+        if 'data' in d and d['data'] is not None:
+            d['data'] = np.atleast_2d(np.asarray(d['data']))
         self._fdir  = None
         self._fdirs = []
         self._individual_emcal_results  = []
@@ -2076,8 +2099,19 @@ class EmissionLWIR(tk.Tk):
 
     def _load_sma_result(self, d: dict, source_path: str = '') -> None:
         for key in ('sample_labels', 'labels', 'groups'):
-            if key in d and hasattr(d[key], 'tolist'):
-                d[key] = [str(s) for s in d[key]]
+            if key in d:
+                d[key] = self._as_str_list(d[key])
+        # A single-sample result is written with a leading sample axis of
+        # length 1, but ``readHDF`` squeezes that singleton away on load
+        # (``measured`` (1, n_wn) → (n_wn,), scalars like ``rms`` → 0-d).
+        # Restore the sample axis on every per-sample array so downstream
+        # ``[idx]`` indexing (data tab and analysis tab) stays valid.
+        if len(d.get('sample_labels', [])) == 1:
+            for key in _SMA_SAMPLE_KEYS:
+                if key == 'sample_labels' or key not in d or d[key] is None:
+                    continue
+                arr = np.asarray(d[key])
+                d[key] = arr[np.newaxis, ...]
         if 'wn_range' in d and hasattr(d['wn_range'], 'tolist'):
             d['wn_range'] = tuple(float(x) for x in d['wn_range'])
         if 'has_slope' in d:
