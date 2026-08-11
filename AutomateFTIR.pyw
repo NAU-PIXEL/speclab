@@ -17,7 +17,28 @@ Hardware
 --------
 Spectrometer : Thermo Nicolet FTIR controlled via OMNIC DDE interface (Windows).
 Multimeter   : Keithley 2700 via PyVISA over TCP/IP (TCPIP::…::SOCKET).
-              Used for temperature monitoring in Emission mode; display-only in T/R.
+               PRT resistance and thermocouple monitoring, Emission mode only.
+
+Multimeter polling
+------------------
+Every reading closes one relay per channel in ``_PANEL_ORDER``, so these rates
+are chosen to limit mechanical wear on the multiplexer card rather than to
+maximise temporal resolution:
+
+  Idle (Emission)    ``MM_POLL_INTERVAL_S``         300 s
+  During collection  ``MM_MEASUREMENT_INTERVAL_S``   30 s, plus one pre- and
+                                                     one post-collection
+                                                     bracket reading
+  Transmission /     no polling — multimeter readings were never logged
+  Reflectance        outside Emission mode
+  On demand          Refresh button; Collect BB also takes its own sweep so
+                     the Warm/Hot auto-selection never acts on a stale
+                     temperature
+
+A collection shorter than 30 s still yields the two bracket readings.  All
+channels are read on every sweep: a hot sample changes the chamber wall and
+door temperatures on measurement timescales, so the housekeeping channels are
+not decimated relative to the PRTs.
 """
 
 # Standard library
@@ -161,7 +182,11 @@ OMNIC_AUTOCONNECT_POLL_MS  = 5_000
 OMNIC_AUTOCONNECT_TIMEOUT_S = 120
 
 # Polling interval for live multimeter display (seconds).
-MM_POLL_INTERVAL_S = 60
+# Kept long to limit relay wear on the Keithley multiplexer card: every poll
+# closes one relay per channel in _PANEL_ORDER.  The Collect BB dialog takes
+# its own on-demand reading, so the BB temperature decision does not depend
+# on this rate (see _on_collect_bb).
+MM_POLL_INTERVAL_S = 300
 
 # Purge equilibration delay shown to the user before every T/R collection (s).
 PURGE_DELAY_S = 30
@@ -171,7 +196,9 @@ COLLECT_MAX_RETRIES   = 30
 COLLECT_RETRY_DELAY_S = 2
 
 # Multimeter sampling interval during a spectrometer collection (seconds).
-MM_MEASUREMENT_INTERVAL_S = 10
+# Collections are bracketed by a pre- and post-collection reading regardless of
+# this interval, so a sub-30 s collection still yields two samples.
+MM_MEASUREMENT_INTERVAL_S = 30
 
 # BB auto-selection thresholds (°C).  When the dialog opens with a live
 # temperature reading, the type is pre-selected based on these values.
@@ -1242,6 +1269,10 @@ class AutomateFTIR(tk.Tk):
         self._poll_thread: threading.Thread | None = None
         self._stop_poll                            = threading.Event()
 
+        # Guard against a second Collect BB click while the pre-dialog
+        # multimeter sweep is still in flight.
+        self._bb_dialog_pending: bool = False
+
         # ── OMNIC auto-connect polling state ─────────────────────────────
         self._spec_polling:    bool  = False
         self._spec_poll_start: float = 0.0
@@ -1845,27 +1876,50 @@ class AutomateFTIR(tk.Tk):
     # -----------------------------------------------------------------------
 
     def _start_live_poll(self) -> None:
-        """Launch the background multimeter polling thread if not already running."""
-        if self._poll_thread is not None and self._poll_thread.is_alive():
+        """Launch the background multimeter polling thread if not already running.
+
+        No-op outside Emission mode.  The multimeter is display-only in
+        Transmission / Reflectance and ``_append_live_log`` discards those
+        readings, so polling there would cycle the Keithley relays for data
+        that is never used.  Gating here covers every caller.
+        """
+        if self._mode_var.get() != 'Emission':
             return
-        self._stop_poll.clear()
+        # Retire any existing thread and hand the new one its own stop flag.
+        # A previous thread is usually still mid-sleep here (collections are
+        # shorter than MM_POLL_INTERVAL_S), and reviving it by clearing a
+        # shared flag races with its own wake-up check.  Per-thread events
+        # make the handover unambiguous: the retired thread sees its flag set
+        # and exits at its next wake without touching the instrument.
+        self._stop_poll.set()
+        self._stop_poll = threading.Event()
         self._poll_thread = threading.Thread(
-            target=self._live_poll_loop, daemon=True)
+            target=self._live_poll_loop, args=(self._stop_poll,), daemon=True)
         self._poll_thread.start()
 
     def _stop_live_poll(self) -> None:
         """Signal the polling thread to exit at its next wake-up."""
         self._stop_poll.set()
 
-    def _live_poll_loop(self) -> None:
+    def _live_poll_loop(self, stop: threading.Event) -> None:
         """
         Background thread: read all channels every ``MM_POLL_INTERVAL_S``
         seconds and post the results to the Tk main thread via ``after``.
 
-        Exits cleanly when ``_stop_poll`` is set or the multimeter disconnects.
+        Exits cleanly when *stop* is set, the mode leaves Emission, or the
+        multimeter disconnects.  The mode check reads the plain ``_last_mode``
+        attribute rather than ``_mode_var`` — Tk variables must not be touched
+        from a worker thread — and backstops any mode switch that does not
+        explicitly stop the thread.
+
+        Parameters
+        ----------
+        stop : threading.Event
+            This thread's own stop flag, assigned by :meth:`_start_live_poll`.
+            Not read from ``self`` — the attribute is rebound on every restart.
         """
-        while not self._stop_poll.wait(MM_POLL_INTERVAL_S):
-            if not self._mm.connected:
+        while not stop.wait(MM_POLL_INTERVAL_S):
+            if not self._mm.connected or self._last_mode != 'Emission':
                 break
             readings = self._mm.read_all_channels(list(_PANEL_ORDER))
             if not self._mm.connected:
@@ -2613,6 +2667,13 @@ class AutomateFTIR(tk.Tk):
             self._exp_file_var.set(
                 default if default in self._exp_files else self._exp_files[0])
             self._cb_exp.config(values=self._exp_files)
+            # This path switches mode without going through _on_mode_change,
+            # so apply the same Emission-only live-poll gating here.
+            if mode == 'Emission':
+                if self._mm.connected and self._mm_mode_var.get() == 'live':
+                    self._start_live_poll()
+            else:
+                self._stop_live_poll()
 
         # ── Set spectrum counter so new spectra don't reuse existing numbers ─
         try:
@@ -2947,6 +3008,14 @@ class AutomateFTIR(tk.Tk):
         self._cb_exp.config(values=self._exp_files)
         if self._spec.connected:
             self._spec_auto_load_params()
+
+        # Live polling runs in Emission mode only (see _start_live_poll).
+        if mode == 'Emission':
+            if self._mm.connected and self._mm_mode_var.get() == 'live':
+                self._start_live_poll()
+        else:
+            self._stop_live_poll()
+
         self._refresh_buttons()
 
     # -----------------------------------------------------------------------
@@ -3181,8 +3250,46 @@ class AutomateFTIR(tk.Tk):
         self._run_collection(name, is_bb=False)
 
     def _on_collect_bb(self) -> None:
-        """Open BB confirmation dialog; start collection only if user confirms."""
+        """Take a fresh multimeter reading, then open the BB confirmation dialog.
+
+        The dialog auto-selects BB Warm / BB Hot from the BB temperature
+        estimate, which the background poll only refreshes every
+        ``MM_POLL_INTERVAL_S`` seconds.  One on-demand sweep here keeps that
+        decision current without raising the background poll rate.
+        """
+        if self._bb_dialog_pending:
+            return   # a sweep is already in flight from a previous click
+        if not self._mm.connected:
+            self._open_bb_dialog()
+            return
+        self._bb_dialog_pending = True
+        self._status_var.set('Reading multimeter…')
+        threading.Thread(target=self._bb_pre_dialog_read, daemon=True).start()
+
+    def _bb_pre_dialog_read(self) -> None:
+        """Background: one-shot sweep, then open the dialog on the main thread.
+
+        The three ``after`` callbacks run FIFO, so the reading is stored and
+        the BB temperature recomputed before the dialog reads it.
+        """
+        try:
+            readings = self._mm.read_all_channels(list(_PANEL_ORDER))
+            self.after(0, lambda r=readings: self._on_refresh_result(r))
+            # Force the live BB estimate even in Sample mode, where the panel
+            # otherwise shows the selected spectrum's stored temperature.
+            self.after(0, self._update_bb_temp)
+        except Exception as exc:
+            logging.warning("Pre-BB-dialog MM read failed: %s", exc)
+        self.after(0, self._open_bb_dialog)
+
+    def _open_bb_dialog(self) -> None:
+        """Main thread: open the BB dialog; start collection only if confirmed."""
+        self._bb_dialog_pending = False
+        self._status_var.set('Ready')
         dlg = _BBCollectDialog(self, self._bb_type_var, self._bb_temp_var)
+        # Restore the Sample-mode panel, which _update_bb_temp overwrote.
+        if self._mm_mode_var.get() == 'sample':
+            self._display_selected_spectrum_channels()
         if dlg.result is None:
             return   # user cancelled
         if dlg.result == 'bbgeneric':
