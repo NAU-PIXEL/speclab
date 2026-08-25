@@ -157,7 +157,7 @@ _VIBRANT_BKG_COLORS = [plt.cm.Set1(i) for i in range(9)]
 # Hardware constants
 # ---------------------------------------------------------------------------
 
-MULTIMETER_ADDRESS   = 'TCPIP::10.12.100.246::1394::SOCKET'
+MULTIMETER_ADDRESS   = 'TCPIP::10.11.100.182::1394::SOCKET'
 OMNIC_SERVER_NAME    = 'OMNIC'
 OMNIC_TOPIC_NAME     = 'SPECTRA'
 OMNIC_PARAM_DIR      = Path(r'C:\my documents\omnic\Param')
@@ -427,7 +427,7 @@ class MultimeterController:
     Parameters
     ----------
     address : str
-        VISA resource string (e.g. ``'TCPIP::10.12.100.246::1394::SOCKET'``).
+        VISA resource string (e.g. ``'TCPIP::10.11.100.182::1394::SOCKET'``).
     """
 
     # Channels 101–102 use 4-wire resistance; 103–107 use temperature.
