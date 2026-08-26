@@ -39,7 +39,7 @@ if __package__ is None:
 
 from .functions import load_sbm, cal_rad, emcal, sma, resample_spectrum, merge, scan_sample_labels, MissingTempsError, read_tes, is_tes_result, moving_average
 from .plot import _add_top_axis
-from .utils import readOMNIC, readEmissionCSVnotes, findFiles, readHDF, saveHDF, save_emcal_csv, save_sma_csv, c2k, r2t_nau, _to_album, _set_window_size
+from .utils import readOMNIC, readEmissionCSVnotes, findFiles, readHDF, saveHDF, save_emcal_csv, save_sma_csv, c2k, r2t_nau, _to_album, _set_window_size, CHANNEL_LABELS as _CHANNEL_LABELS
 from .config import get_config
 from . import __version__
 from .SpeclibViewer import (
@@ -171,16 +171,6 @@ for _cmc_name in ['batlowS', 'hawaiiS', 'lipariS', 'tokyoS']:
         _COLOR_SCHEMES[_cmc_name] = _cols
 _COLOR_SCHEME_DEFAULT = 'Standard'
 _AN_COLOR_OTHER = '#cccccc'
-
-_CHANNEL_LABELS: dict[int, str] = {
-    101: 'BB resistance low',
-    102: 'BB resistance high',
-    103: 'Mirror',
-    104: 'Chamber exterior',
-    105: 'Chamber interior',
-    106: 'Chamber door',
-    107: 'Detector',
-}
 
 plt.rcParams['axes.prop_cycle'] = plt.cycler(color=_COLOR_SCHEMES[_COLOR_SCHEME_DEFAULT])
 

@@ -16,6 +16,7 @@ rad2wl / rad2wn         Spectral radiance unit conversions.
 r2t_lo / r2t_hi         PRT resistance → temperature (NAU PRTs 31985/31986).
 r2t_swri                PRT resistance → temperature (SwRI PRTs).
 r2t_nau                 PRT resistance → temperature (NAU standard, returns K).
+CHANNEL_LABELS          Keithley 2700 channel map (fixed wiring, not config).
 readEmissionTXTnotes    Parse legacy TXT emission measurement notes.
 readEmissionCSVnotes    Load CSV/XLS emission measurement notes.
 readOMNIC               Read a two-column OMNIC CSV spectrum file.
@@ -370,6 +371,32 @@ def rad2wn(
     wn = 1e4 / wl
     L2 = L1 * 1e4 ** 2 / wl
     return wn, L2
+
+
+# =============================================================================
+# ============================ Keithley channel map ===========================
+# =============================================================================
+# Physical wiring of the Keithley 2700 multiplexer card.  Deliberately *not*
+# user-configurable: the channel numbers are a data contract.  They appear as
+# the ``channel_101``..``channel_107`` columns of every measurement-info CSV,
+# are read back by readEmissionCSVnotes below and by functions.py, plot.py and
+# EmissionLWIR.py, and the radiometric pipeline binds roles to specific numbers
+# (functions.py uses channel_105 as the downwelling temperature source; 101/102
+# are the resistance pair consumed by r2t_nau immediately below).  Editing these
+# would silently invalidate historical datasets.
+#
+# Defined here rather than in either GUI so the two cannot drift — AutomateFTIR
+# and EmissionLWIR previously held separate copies that disagreed on 101/102.
+CHANNEL_LABELS: dict[int, str] = {
+    101: 'BB resistance low',
+    102: 'BB resistance high',
+    103: 'Mirror',
+    104: 'Chamber exterior',
+    105: 'Chamber interior',
+    106: 'Chamber door',
+    107: 'Detector',
+}
+
 
 # =============================================================================
 # =============================== r2t_lo ======================================

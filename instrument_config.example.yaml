@@ -1,0 +1,83 @@
+# AutomateFTIR instrument configuration -- EXAMPLE / TEMPLATE
+#
+# This file is tracked in git and serves as the schema reference.  It is
+# copied to `instrument_config.yaml` (untracked) the first time AutomateFTIR
+# runs on a machine.  Edit the copy, not this file.
+#
+# Values marked CHANGE ME are site-specific and must be filled in per machine.
+# Everything else ships with lab-validated defaults; read the comments before
+# altering them.
+#
+# Windows paths: leave them unquoted or single-quoted so backslashes stay
+# literal.  Double-quoted YAML would interpret `\o` in `C:\...\omnic\Param`
+# as an escape sequence.
+#
+# Not configurable here, by design:
+#   - DDE protocol identifiers (OMNIC server/topic names) are protocol
+#     constants, not settings.
+#   - Multimeter channel numbers, labels, units, and the resistance/temperature
+#     split are a data contract.  The `channel_101`..`channel_107` columns in
+#     measurement-info CSVs are read by utils.py, functions.py, plot.py and
+#     EmissionLWIR.py, and the science pipeline hardcodes channel roles (e.g.
+#     channel_105 is the downwelling temperature source).  Changing them here
+#     would silently invalidate historical datasets.
+
+multimeter:
+  # Keithley 2700 VISA resource string.
+  # CHANGE ME -- this is a documentation-range placeholder, not a real address.
+  address: 'TCPIP::192.0.2.10::1394::SOCKET'
+
+  # Idle polling interval for the live display, seconds.
+  #
+  # Every poll closes one relay per channel on the multiplexer card, so this
+  # rate is the dominant driver of mechanical wear -- not a refresh-rate
+  # preference.  It was raised 60 -> 300 s in v0.10.2 specifically to reduce
+  # wear (~7600 -> ~2400 relay closures on a 30-collection day).
+  #
+  # The Collect BB dialog takes its own on-demand reading, so the Warm/Hot
+  # decision never depends on this rate.  Do not shorten casually.
+  poll_interval_s: 300
+
+  # Sampling interval during a spectrometer collection, seconds.
+  # Collections are bracketed by a pre- and post-collection reading regardless,
+  # so a sub-30 s collection still yields two samples.
+  measurement_interval_s: 30
+
+omnic:
+  # OMNIC experiment parameter (.exp) directory and executable.
+  # Defaults below are the standard OMNIC install locations.
+  param_dir: C:\my documents\omnic\Param
+  exe:       C:\Program Files (x86)\omnic\omnic32.exe
+
+  # Auto-connect polling after launching OMNIC.
+  autoconnect_poll_ms:   5000
+  autoconnect_timeout_s: 120
+
+  # Retry parameters for the CollectSample DDE command.
+  # OMNIC NACKs while busy, so retries are expected, not exceptional.
+  collect_max_retries:   30
+  collect_retry_delay_s: 2
+
+  # Per-mode .exp parameter file defaults and the keyword filters used to
+  # populate the parameter-file dropdown.  `file` names must exist in
+  # `param_dir`.  Rename a .exp file and you must update both fields.
+  experiments:
+    Emission:     {file: 'Emission_MIR - Heated Sample.exp', keywords: [emission]}
+    Transmission: {file: 'Transmission MIR.exp',             keywords: [transmiss]}
+    Reflectance:  {file: 'DiffusIR_MIR.exp',                 keywords: [diffusir, reflect]}
+
+blackbody:
+  # Auto-selection thresholds for the Collect BB dialog, degrees C.
+  # When the dialog opens with a live temperature reading, the BB type is
+  # pre-selected from these.  warm_min_c must be below hot_min_c.
+  warm_min_c: 40.0   # below this: no auto-selection (BB not ready)
+  hot_min_c:  90.0   # at or above this: auto-select BB Hot
+
+collection:
+  # Purge equilibration delay shown before every T/R collection, seconds.
+  purge_delay_s: 30
+
+data:
+  # Default save folder offered in the folder picker.
+  # CHANGE ME -- contains a per-machine user path.
+  default_dir: C:\Users\<username>\Nextcloud\107 Storage\FTIR Data

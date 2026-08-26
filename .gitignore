@@ -39,3 +39,9 @@ debug/wards_comparison/
 # Docs in progress — un-ignore and commit these with v1.0.0
 AutomateFTIR_User_Manual.docx
 CLAUDE.md
+
+# Working notes - not for commit
+INSTRUMENT_CONFIG_PLAN.md
+
+# Machine-specific instrument settings (seeded from instrument_config.example.yaml)
+instrument_config.yaml

@@ -23,19 +23,22 @@ Multimeter polling
 ------------------
 Every reading closes one relay per channel in ``_PANEL_ORDER``, so these rates
 are chosen to limit mechanical wear on the multiplexer card rather than to
-maximise temporal resolution:
+maximise temporal resolution.  The intervals are configurable in
+``instrument_config.yaml``; shipped defaults are given below.
 
-  Idle (Emission)    ``MM_POLL_INTERVAL_S``         300 s
-  During collection  ``MM_MEASUREMENT_INTERVAL_S``   30 s, plus one pre- and
-                                                     one post-collection
-                                                     bracket reading
+  Idle (Emission)    ``multimeter.poll_interval_s``         default 300 s
+  During collection  ``multimeter.measurement_interval_s``  default  30 s, plus
+                                                            one pre- and one
+                                                            post-collection
+                                                            bracket reading
   Transmission /     no polling — multimeter readings were never logged
   Reflectance        outside Emission mode
   On demand          Refresh button; Collect BB also takes its own sweep so
                      the Warm/Hot auto-selection never acts on a stale
                      temperature
 
-A collection shorter than 30 s still yields the two bracket readings.  All
+A collection shorter than the measurement interval still yields the two
+bracket readings.  All
 channels are read on every sweep: a hot sample changes the chamber wall and
 door temperatures on measurement timescales, so the housekeeping channels are
 not decimated relative to the PRTs.
@@ -80,8 +83,11 @@ if __package__ is None:
     __package__ = 'speclab'
 
 from .plot import _add_top_axis
-from .utils import readOMNIC, normalize, r2t_nau, c2k, _set_window_size
+from .utils import (readOMNIC, normalize, r2t_nau, c2k, _set_window_size,
+                    CHANNEL_LABELS as _CHANNEL_LABELS)
 from .functions import emcal, tracal, refcal, MissingTempsError
+from .instrument_config import (load_instrument_config, update_instrument_config,
+                                InstrumentConfigError)
 from . import __version__
 
 # ---------------------------------------------------------------------------
@@ -154,86 +160,98 @@ _BB_WARM_COLOR = 'blue'
 _VIBRANT_BKG_COLORS = [plt.cm.Set1(i) for i in range(9)]
 
 # ---------------------------------------------------------------------------
-# Hardware constants
+# Instrument configuration
+#
+# Site-specific and operational settings load from instrument_config.yaml; see
+# instrument_config.py for the schema and the rationale for keeping the live
+# file untracked.  Values are unpacked into module globals so that every
+# existing reference below continues to work unchanged.
 # ---------------------------------------------------------------------------
 
-MULTIMETER_ADDRESS   = 'TCPIP::10.11.100.182::1394::SOCKET'
-OMNIC_SERVER_NAME    = 'OMNIC'
-OMNIC_TOPIC_NAME     = 'SPECTRA'
-OMNIC_PARAM_DIR      = Path(r'C:\my documents\omnic\Param')
-OMNIC_EXE            = Path(r'C:\Program Files (x86)\omnic\omnic32.exe')
-DEFAULT_DATA_DIR     = Path(r'C:\Users\ftir_spec_user\Nextcloud\107 Storage\FTIR Data')
-DEFAULT_EXP_FILENAME = 'Emission_MIR - Heated Sample.exp'  # legacy alias
+try:
+    _CFG, _CONFIG_FIRST_RUN = load_instrument_config()
+except InstrumentConfigError as _exc:
+    # This file runs as .pyw, which suppresses the console: an uncaught
+    # traceback here would leave the user staring at nothing.  Surface the
+    # message in a dialog before re-raising.
+    _err_root = tk.Tk()
+    _err_root.withdraw()
+    messagebox.showerror('AutomateFTIR — configuration error', str(_exc))
+    _err_root.destroy()
+    raise
+
+MULTIMETER_ADDRESS        = _CFG['multimeter']['address']
+MM_POLL_INTERVAL_S        = _CFG['multimeter']['poll_interval_s']
+MM_MEASUREMENT_INTERVAL_S = _CFG['multimeter']['measurement_interval_s']
+
+# DDE protocol identifiers, not settings — these name the OMNIC DDE service
+# itself and are fixed by the protocol, so they stay in the source.
+OMNIC_SERVER_NAME = 'OMNIC'
+OMNIC_TOPIC_NAME  = 'SPECTRA'
+
+OMNIC_PARAM_DIR             = _CFG['omnic']['param_dir']
+OMNIC_EXE                   = _CFG['omnic']['exe']
+OMNIC_AUTOCONNECT_POLL_MS   = _CFG['omnic']['autoconnect_poll_ms']
+OMNIC_AUTOCONNECT_TIMEOUT_S = _CFG['omnic']['autoconnect_timeout_s']
+COLLECT_MAX_RETRIES         = _CFG['omnic']['collect_max_retries']
+COLLECT_RETRY_DELAY_S       = _CFG['omnic']['collect_retry_delay_s']
+
+DEFAULT_DATA_DIR = _CFG['data']['default_dir']
+PURGE_DELAY_S    = _CFG['collection']['purge_delay_s']
+
+_BB_TEMP_WARM_MIN_C = _CFG['blackbody']['warm_min_c']
+_BB_TEMP_HOT_MIN_C  = _CFG['blackbody']['hot_min_c']
 
 # Per-mode OMNIC experiment parameter file defaults and keyword filters.
+# Stored together in the config so a renamed .exp file cannot update one
+# without the other.
 _MODE_EXP_DEFAULTS: dict[str, str] = {
-    'Emission':     'Emission_MIR - Heated Sample.exp',
-    'Transmission': 'Transmission MIR.exp',
-    'Reflectance':  'DiffusIR_MIR.exp',
+    mode: entry['file'] for mode, entry in _CFG['omnic']['experiments'].items()
 }
 _MODE_EXP_KEYWORDS: dict[str, list[str]] = {
-    'Emission':     ['emission'],
-    'Transmission': ['transmiss'],
-    'Reflectance':  ['diffusir', 'reflect'],
+    mode: list(entry['keywords'])
+    for mode, entry in _CFG['omnic']['experiments'].items()
 }
 
-# Auto-connect polling for OMNIC (ms between attempts, total timeout in seconds).
-OMNIC_AUTOCONNECT_POLL_MS  = 5_000
-OMNIC_AUTOCONNECT_TIMEOUT_S = 120
-
-# Polling interval for live multimeter display (seconds).
-# Kept long to limit relay wear on the Keithley multiplexer card: every poll
-# closes one relay per channel in _PANEL_ORDER.  The Collect BB dialog takes
-# its own on-demand reading, so the BB temperature decision does not depend
-# on this rate (see _on_collect_bb).
-MM_POLL_INTERVAL_S = 300
-
-# Purge equilibration delay shown to the user before every T/R collection (s).
-PURGE_DELAY_S = 30
-
-# Retry parameters for CollectSample DDE command (OMNIC may NACK when busy).
-COLLECT_MAX_RETRIES   = 30
-COLLECT_RETRY_DELAY_S = 2
-
-# Multimeter sampling interval during a spectrometer collection (seconds).
-# Collections are bracketed by a pre- and post-collection reading regardless of
-# this interval, so a sub-30 s collection still yields two samples.
-MM_MEASUREMENT_INTERVAL_S = 30
-
-# BB auto-selection thresholds (°C).  When the dialog opens with a live
-# temperature reading, the type is pre-selected based on these values.
-_BB_TEMP_WARM_MIN_C = 40.0   # below this: no auto-selection (BB not ready)
-_BB_TEMP_HOT_MIN_C  = 90.0   # at or above this: auto-select BB Hot
+# Legacy alias — only ever the fallback in _MODE_EXP_DEFAULTS.get(mode, ...),
+# so it is derived rather than configured separately.
+DEFAULT_EXP_FILENAME = _MODE_EXP_DEFAULTS['Emission']
 
 # ---------------------------------------------------------------------------
 # Channel metadata
+#
+# The physical wiring of the Keithley multiplexer card.  Deliberately not
+# configurable: these channel numbers are the measurement-info CSV schema and
+# the science pipeline binds roles to specific numbers.  Labels live in
+# utils.CHANNEL_LABELS, shared with EmissionLWIR so the two cannot drift.
 # ---------------------------------------------------------------------------
 
-_CHANNEL_LABELS: dict[int, str] = {
-    101: '101: PRT Resistance',
-    102: '102: PRT Resistance',
-    103: '103: Mirror',
-    104: '104: Chamber exterior',
-    105: '105: Chamber interior',
-    106: '106: Chamber door',
-    107: '107: Detector',
+# Channels 101–102 use 4-wire resistance; 103–107 use temperature.
+_CHANNEL_MODES: dict[int, str] = {
+    101: 'FRES',
+    102: 'FRES',
+    103: 'Temperature',
+    104: 'Temperature',
+    105: 'Temperature',
+    106: 'Temperature',
+    107: 'Temperature',
 }
 
+# Display unit follows from the measurement function, so it is derived rather
+# than declared: a parallel dict could silently disagree with the instrument.
+_MODE_UNITS: dict[str, str] = {'FRES': 'Ω', 'Temperature': '°C'}
 _CHANNEL_UNITS: dict[int, str] = {
-    101: 'Ω',
-    102: 'Ω',
-    103: '°C',
-    104: '°C',
-    105: '°C',
-    106: '°C',
-    107: '°C',
+    ch: _MODE_UNITS[mode] for ch, mode in _CHANNEL_MODES.items()
 }
 
-# Display order: ascending channels; separator falls between resistance and temperature.
-_PANEL_ORDER: list[int] = [101, 102, 103, 104, 105, 106, 107]
+# Display order: ascending channels.
+_PANEL_ORDER: list[int] = sorted(_CHANNEL_MODES)
 
-# Channel after which a visual separator is inserted in the multimeter panel.
-_PANEL_SEPARATOR_AFTER: int = 102
+# Channel after which a visual separator is inserted in the multimeter panel:
+# the last resistance channel, i.e. the resistance/temperature boundary.
+_PANEL_SEPARATOR_AFTER: int = max(
+    ch for ch, mode in _CHANNEL_MODES.items() if mode == 'FRES'
+)
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +429,242 @@ class ExperimentParamsDialog(tk.Toplevel):
             row=len(self._LABELS), column=0, columnspan=2, pady=(12, 0))
 
 
+def _apply_config(cfg: dict) -> None:
+    """
+    Re-point the module globals at a freshly saved configuration.
+
+    Only the values the settings dialog can edit are refreshed; timing and
+    policy values are read once at import because changing them mid-session
+    would leave running poll threads on stale intervals.
+
+    Parameters
+    ----------
+    cfg : dict
+        Newly loaded configuration.
+    """
+    global _CFG, MULTIMETER_ADDRESS, OMNIC_PARAM_DIR, OMNIC_EXE, DEFAULT_DATA_DIR
+    _CFG               = cfg
+    MULTIMETER_ADDRESS = cfg['multimeter']['address']
+    OMNIC_PARAM_DIR    = cfg['omnic']['param_dir']
+    OMNIC_EXE          = cfg['omnic']['exe']
+    DEFAULT_DATA_DIR   = cfg['data']['default_dir']
+
+
+class InstrumentConfigDialog(tk.Toplevel):
+    """
+    Editor for the machine-specific entries in ``instrument_config.yaml``.
+
+    Scope is deliberately narrow: the multimeter address and the three
+    filesystem paths.  Timing and policy values (poll intervals, retry counts,
+    blackbody thresholds) stay hand-edited in the YAML, where the comment
+    explaining *why* each value is what it is sits directly above it.  The
+    relay-wear budget on ``poll_interval_s`` is exactly the kind of value that
+    fails silently when someone shortens it because the display feels sluggish,
+    so it is not offered as a spinbox.
+
+    Parameters
+    ----------
+    master : tk.Misc
+        Parent window.
+    cfg : dict
+        Currently loaded configuration, used to pre-fill the fields.
+    first_run : bool, optional
+        True when the file was just seeded from the template, which adds an
+        explanatory header.
+
+    Attributes
+    ----------
+    saved : bool
+        True if the user saved; the caller reconnects the multimeter when so.
+    """
+
+    # (section, key, label, browse kind — '' for none, 'dir' or 'file')
+    _FIELDS: list[tuple[str, str, str, str]] = [
+        ('multimeter', 'address',     'Multimeter address',  ''),
+        ('omnic',      'param_dir',   'OMNIC parameter dir', 'dir'),
+        ('omnic',      'exe',         'OMNIC executable',    'file'),
+        ('data',       'default_dir', 'Default data folder', 'dir'),
+    ]
+
+    def __init__(self, master: tk.Misc, cfg: dict,
+                 first_run: bool = False) -> None:
+        super().__init__(master)
+        self.title('Instrument Configuration')
+        self.resizable(False, False)
+        self.transient(master)
+        self.saved       = False
+        self._first_run  = first_run
+        self._testing    = False
+        self._vars: dict[tuple[str, str], tk.StringVar]        = {}
+        self._status: dict[tuple[str, str], tk.StringVar]      = {}
+        self._status_lbl: dict[tuple[str, str], ttk.Label]     = {}
+        self._build(cfg, first_run)
+        self.grab_set()
+
+    def _build(self, cfg: dict, first_run: bool) -> None:
+        frm = ttk.Frame(self, padding=14)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        row = 0
+        if first_run:
+            ttk.Label(
+                frm,
+                text=('No instrument configuration was found, so a template has '
+                      'been created.\nFill in the values for this machine, then '
+                      'press Test to check them.'),
+                anchor=tk.W, justify=tk.LEFT,
+            ).grid(row=row, column=0, columnspan=4, sticky=tk.W, pady=(0, 10))
+            row += 1
+
+        for sec, key, label, kind in self._FIELDS:
+            ttk.Label(frm, text=f'{label}:', anchor=tk.W).grid(
+                row=row, column=0, sticky=tk.W, padx=(0, 8), pady=3)
+
+            var = tk.StringVar(value=str(cfg[sec][key]))
+            self._vars[(sec, key)] = var
+            ttk.Entry(frm, textvariable=var, width=54).grid(
+                row=row, column=1, sticky=tk.EW, pady=3)
+
+            if kind:
+                ttk.Button(
+                    frm, text='Browse…', width=9,
+                    command=lambda v=var, k=kind: self._browse(v, k),
+                ).grid(row=row, column=2, padx=(6, 0), pady=3)
+
+            svar = tk.StringVar(value='')
+            self._status[(sec, key)] = svar
+            lbl = ttk.Label(frm, textvariable=svar, anchor=tk.W,
+                            foreground='gray', width=34)
+            lbl.grid(row=row, column=3, sticky=tk.W, padx=(8, 0), pady=3)
+            self._status_lbl[(sec, key)] = lbl
+            row += 1
+
+        ttk.Label(
+            frm,
+            text=('Timing, retry and blackbody settings are edited directly in '
+                  'instrument_config.yaml,\nwhere the notes explaining each '
+                  'value live.'),
+            anchor=tk.W, justify=tk.LEFT, foreground='gray',
+        ).grid(row=row, column=0, columnspan=4, sticky=tk.W, pady=(10, 0))
+        row += 1
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=row, column=0, columnspan=4, sticky=tk.E, pady=(14, 0))
+        self._test_btn = ttk.Button(btns, text='Test', width=10,
+                                    command=self._on_test)
+        self._test_btn.pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btns, text='Save', width=10,
+                   command=self._on_save).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btns, text='Cancel', width=10,
+                   command=self._on_cancel).pack(side=tk.LEFT)
+
+    def _browse(self, var: tk.StringVar, kind: str) -> None:
+        """Open a folder or file picker seeded with the field's current value."""
+        current = Path(var.get().strip())
+        if kind == 'dir':
+            start = current if current.is_dir() else current.parent
+            chosen = filedialog.askdirectory(
+                parent=self, initialdir=str(start) if start.exists() else None)
+        else:
+            start = current.parent
+            chosen = filedialog.askopenfilename(
+                parent=self,
+                initialdir=str(start) if start.exists() else None,
+                filetypes=[('Executable', '*.exe'), ('All files', '*.*')])
+        if chosen:
+            var.set(str(Path(chosen)))
+
+    # ── Connection test ─────────────────────────────────────────────────────
+
+    def _on_test(self) -> None:
+        """Probe the entered values off the UI thread so a bad address cannot hang."""
+        if self._testing:
+            return
+        self._testing = True
+        self._test_btn.config(state=tk.DISABLED)
+        for (sec, key), svar in self._status.items():
+            svar.set('testing…')
+            self._status_lbl[(sec, key)].config(foreground='gray')
+        values = {k: v.get().strip() for k, v in self._vars.items()}
+        threading.Thread(target=self._test_worker, args=(values,),
+                         daemon=True).start()
+
+    def _test_worker(self, values: dict[tuple[str, str], str]) -> None:
+        """
+        Run the probes in a worker thread and marshal results back to the UI.
+
+        The multimeter is probed with a real VISA open plus an ``*IDN?`` query,
+        which distinguishes "something answered on that address" from "the
+        Keithley answered".  Paths are checked on disk.
+
+        OMNIC's DDE link is deliberately not probed: opening a second
+        conversation while the app holds one could disturb an in-progress
+        collection.  The indicator light already reports that connection.
+        """
+        results: dict[tuple[str, str], tuple[bool, str]] = {}
+
+        addr = values[('multimeter', 'address')]
+        try:
+            res = pyvisa.ResourceManager().open_resource(addr)
+            try:
+                res.read_termination = '\n'
+                res.timeout = 3000
+                try:
+                    idn = res.query('*IDN?').strip()
+                    detail = idn[:44] if idn else 'connected'
+                except Exception:
+                    detail = 'connected (no *IDN? reply)'
+            finally:
+                res.close()
+            results[('multimeter', 'address')] = (True, detail)
+        except Exception as exc:
+            results[('multimeter', 'address')] = (False, str(exc)[:44])
+
+        for sec, key, _label, kind in self._FIELDS:
+            if not kind:
+                continue
+            p  = Path(values[(sec, key)])
+            ok = p.is_dir() if kind == 'dir' else p.is_file()
+            results[(sec, key)] = (ok, 'found' if ok else 'not found')
+
+        self.after(0, self._test_done, results)
+
+    def _test_done(self, results: dict[tuple[str, str], tuple[bool, str]]) -> None:
+        """Render probe results back into the per-field status labels."""
+        for target, (ok, detail) in results.items():
+            self._status[target].set(f'{"✓" if ok else "✗"} {detail}')
+            self._status_lbl[target].config(
+                foreground='dark green' if ok else 'red')
+        self._testing = False
+        self._test_btn.config(state=tk.NORMAL)
+
+    # ── Save / cancel ───────────────────────────────────────────────────────
+
+    def _on_save(self) -> None:
+        """Write the fields back to the YAML, then refresh the module globals."""
+        values = {k: v.get().strip() for k, v in self._vars.items()}
+        try:
+            update_instrument_config(values)
+            cfg, _ = load_instrument_config()
+        except InstrumentConfigError as exc:
+            messagebox.showerror('Configuration not saved', str(exc), parent=self)
+            return
+        _apply_config(cfg)
+        self.saved = True
+        logging.info("Instrument configuration updated")
+        self.destroy()
+
+    def _on_cancel(self) -> None:
+        """Close without saving."""
+        if self._first_run:
+            # Deliberate: Transmission and Reflectance never touch the
+            # multimeter, so a placeholder address must not block startup.
+            logging.warning(
+                "Instrument configuration left at template defaults — "
+                "multimeter will not connect until it is set")
+        self.destroy()
+
+
 # ---------------------------------------------------------------------------
 # MultimeterController
 # ---------------------------------------------------------------------------
@@ -427,19 +681,9 @@ class MultimeterController:
     Parameters
     ----------
     address : str
-        VISA resource string (e.g. ``'TCPIP::10.11.100.182::1394::SOCKET'``).
+        VISA resource string (e.g. ``'TCPIP::192.0.2.10::1394::SOCKET'``).
+        The live value comes from ``instrument_config.yaml``.
     """
-
-    # Channels 101–102 use 4-wire resistance; 103–107 use temperature.
-    _CHANNEL_MODES: dict[int, str] = {
-        101: 'FRES',
-        102: 'FRES',
-        103: 'Temperature',
-        104: 'Temperature',
-        105: 'Temperature',
-        106: 'Temperature',
-        107: 'Temperature',
-    }
 
     # Trailing chars to strip from the SCPI response token.
     # Empirical from ftir-automation-v4.py: FRES strips 5, Temperature strips 2.
@@ -454,6 +698,22 @@ class MultimeterController:
     def connected(self) -> bool:
         """True if a VISA resource is currently open."""
         return self._resource is not None
+
+    @property
+    def address(self) -> str:
+        """Current VISA resource string."""
+        return self._address
+
+    @address.setter
+    def address(self, value: str) -> None:
+        """
+        Re-point the controller at a different instrument.
+
+        Does not reconnect: call ``connect`` afterwards, which closes any open
+        session first.  Used by the settings dialog so an address change takes
+        effect without restarting the GUI.
+        """
+        self._address = value
 
     def connect(self) -> bool:
         """
@@ -514,7 +774,7 @@ class MultimeterController:
         """
         if self._resource is None:
             raise RuntimeError("Multimeter not connected")
-        mode  = self._CHANNEL_MODES[channel]
+        mode  = _CHANNEL_MODES[channel]
         strip = self._STRIP[mode]
         with self._lock:
             try:
@@ -1295,13 +1555,13 @@ class AutomateFTIR(tk.Tk):
         logging.getLogger().addHandler(self._log_handler)
 
         # Rotating file log — DEBUG and above, full timestamps and module info.
-        _LOG_PATH = Path(__file__).resolve().parent / 'AutomateFTIR.log'
+        self._log_path = Path(__file__).resolve().parent / 'AutomateFTIR.log'
         _file_fmt = logging.Formatter(
             '%(asctime)s  [%(levelname)-8s]  %(module)s.%(funcName)s  %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S',
         )
         self._file_log_handler = logging.handlers.RotatingFileHandler(
-            _LOG_PATH,
+            self._log_path,
             maxBytes=2 * 1024 * 1024,   # 2 MB per file
             backupCount=3,
             encoding='utf-8',
@@ -1320,19 +1580,64 @@ class AutomateFTIR(tk.Tk):
         )
         self._file_log_handler.stream.flush()
 
-        logging.info("AutomateFTIR %s started — log: %s", __version__, _LOG_PATH)
+        logging.info("AutomateFTIR %s started — log: %s", __version__, self._log_path)
 
-        # Attempt auto-connect after the window is visible.
-        self.after(600, self._auto_connect)
+        # Configure (if needed) then auto-connect, once the window is visible.
+        self.after(600, self._startup)
 
     # -----------------------------------------------------------------------
     # UI construction
     # -----------------------------------------------------------------------
 
     def _build_ui(self) -> None:
+        self._build_menubar()
         self._build_top_frame()
         ttk.Separator(self, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=6, pady=(2, 0))
         self._build_main_frame()
+
+    def _build_menubar(self) -> None:
+        """Attach the window menu bar."""
+        menubar = tk.Menu(self)
+
+        settings = tk.Menu(menubar, tearoff=0)
+        settings.add_command(label='Instrument configuration…',
+                             command=self._on_instrument_config)
+        settings.add_separator()
+        settings.add_command(label='Experiment parameters…',
+                             command=self._on_show_params)
+        menubar.add_cascade(label='Settings', menu=settings)
+
+        helpmenu = tk.Menu(menubar, tearoff=0)
+        helpmenu.add_command(label='About…', command=self._on_about)
+        menubar.add_cascade(label='Help', menu=helpmenu)
+
+        self.config(menu=menubar)
+
+    def _on_about(self) -> None:
+        """Show version and the paths this session is using."""
+        messagebox.showinfo(
+            'About AutomateFTIR',
+            f'AutomateFTIR {__version__}\n\n'
+            f'Multimeter: {MULTIMETER_ADDRESS}\n'
+            f'OMNIC params: {OMNIC_PARAM_DIR}\n'
+            f'Data folder: {DEFAULT_DATA_DIR}\n\n'
+            f'Log: {self._log_path}',
+            parent=self)
+
+    def _on_instrument_config(self, first_run: bool = False) -> None:
+        """
+        Open the instrument settings dialog and apply the result.
+
+        Re-points and reconnects the multimeter on save, so an address change
+        takes effect without restarting.  ``connect`` closes any open session
+        first, making the re-point safe even while connected.
+        """
+        dlg = InstrumentConfigDialog(self, _CFG, first_run=first_run)
+        self.wait_window(dlg)
+        if not dlg.saved:
+            return
+        self._mm.address = MULTIMETER_ADDRESS
+        self._connect_multimeter()
 
     # ── Top frame ───────────────────────────────────────────────────────────
 
@@ -1716,7 +2021,7 @@ class AutomateFTIR(tk.Tk):
 
         grid_row = 2
         for ch in _PANEL_ORDER:
-            ttk.Label(mm_frame, text=f'{_CHANNEL_LABELS[ch]}:', anchor=tk.W).grid(
+            ttk.Label(mm_frame, text=f'{ch}: {_CHANNEL_LABELS[ch]}:', anchor=tk.W).grid(
                 row=grid_row, column=0, sticky=tk.W, padx=(0, 4), pady=2)
             ttk.Label(
                 mm_frame,
@@ -1770,6 +2075,20 @@ class AutomateFTIR(tk.Tk):
     # -----------------------------------------------------------------------
     # Connection management
     # -----------------------------------------------------------------------
+
+    def _startup(self) -> None:
+        """
+        Run first-run configuration if needed, then auto-connect.
+
+        The two steps are serialised deliberately.  The settings dialog is
+        modal and runs a nested event loop, so scheduling auto-connect
+        separately would let it fire while the dialog is still open — and try
+        to reach the template's placeholder address.
+        """
+        if _CONFIG_FIRST_RUN:
+            logging.info("No instrument configuration found — prompting")
+            self._on_instrument_config(first_run=True)
+        self._auto_connect()
 
     def _auto_connect(self) -> None:
         """Connect to the multimeter; connect to OMNIC if already open, else launch it."""

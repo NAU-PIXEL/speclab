@@ -78,6 +78,30 @@ after activating the environment:
 pip install pyvisa pywin32
 ```
 
+### AutomateFTIR first run
+
+Machine-specific settings — the Keithley's network address and the OMNIC and
+data paths — live in `instrument_config.yaml` at the package root. That file is
+**not tracked by git**, so it never conflicts on `git pull` and the lab's
+internal address never reaches the repository.
+
+On first launch AutomateFTIR creates it from the tracked template
+`instrument_config.example.yaml` and opens a settings dialog. Fill in the four
+values for this machine and press **Test** — it opens a real VISA connection to
+the multimeter and checks that the OMNIC directory, the OMNIC executable, and
+the data folder exist on disk. Then press **Save**.
+
+The same dialog is available later under **Settings → Instrument
+configuration**. Saving re-points and reconnects the multimeter without
+restarting the GUI.
+
+Timing and policy values (poll intervals, retry counts, blackbody thresholds)
+are edited directly in `instrument_config.yaml` rather than through the dialog,
+because the comments explaining each value sit next to it. The multimeter poll
+interval in particular is a relay-wear budget, not a refresh-rate preference —
+read the note above it before shortening it. Changing timing values takes effect
+on the next launch.
+
 ## Quick start
 
 ```python

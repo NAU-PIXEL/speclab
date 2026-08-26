@@ -78,4 +78,4 @@ from .utils import (
 from . import plot
 from .config import configure, get_config
 
-__version__ = "0.10.3"
+__version__ = "0.11.0"
