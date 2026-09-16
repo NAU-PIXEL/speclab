@@ -23,7 +23,7 @@
 #     would silently invalidate historical datasets.
 
 multimeter:
-  # Keithley 2700 VISA resource string.
+  # Keithley 2701 VISA resource string.
   # CHANGE ME -- this is a documentation-range placeholder, not a real address.
   address: 'TCPIP::192.0.2.10::1394::SOCKET'
 

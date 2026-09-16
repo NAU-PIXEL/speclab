@@ -16,7 +16,7 @@ Main    : matplotlib spectral display (wavenumber bottom / wavelength top)
 Hardware
 --------
 Spectrometer : Thermo Nicolet FTIR controlled via OMNIC DDE interface (Windows).
-Multimeter   : Keithley 2700 via PyVISA over TCP/IP (TCPIP::…::SOCKET).
+Multimeter   : Keithley 2701 via PyVISA over TCP/IP (TCPIP::…::SOCKET).
                PRT resistance and thermocouple monitoring, Emission mode only.
 
 Multimeter polling
@@ -69,10 +69,10 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 import matplotlib.pyplot as plt
 
-# Hardware — Windows only
+# Hardware — Windows only.  The instrument drivers themselves live in
+# speclab.automation; pyvisa is still imported here for the exception types
+# referenced by the GUI's error handling.
 import pyvisa
-import win32ui  # initialises the win32 OLE layer required by dde  # noqa: F401
-import dde
 
 # ---------------------------------------------------------------------------
 # Package bootstrap — allow running directly as a script
@@ -86,8 +86,14 @@ from .plot import _add_top_axis
 from .utils import (readOMNIC, normalize, r2t_nau, c2k, _set_window_size,
                     CHANNEL_LABELS as _CHANNEL_LABELS)
 from .functions import emcal, tracal, refcal, MissingTempsError
-from .instrument_config import (load_instrument_config, update_instrument_config,
-                                InstrumentConfigError)
+from .automation.settings import (load_instrument_config,
+                                  update_instrument_config,
+                                  InstrumentConfigError)
+from .automation.multimeter import (MultimeterController,
+                                    CHANNEL_MODES as _CHANNEL_MODES,
+                                    CHANNEL_UNITS as _CHANNEL_UNITS)
+from .automation.spectrometer import (SpectrometerController,
+                                      OMNIC_SERVER_NAME, OMNIC_TOPIC_NAME)
 from . import __version__
 
 # ---------------------------------------------------------------------------
@@ -163,7 +169,7 @@ _VIBRANT_BKG_COLORS = [plt.cm.Set1(i) for i in range(9)]
 # Instrument configuration
 #
 # Site-specific and operational settings load from instrument_config.yaml; see
-# instrument_config.py for the schema and the rationale for keeping the live
+# automation/settings.py for the schema and the rationale for keeping the live
 # file untracked.  Values are unpacked into module globals so that every
 # existing reference below continues to work unchanged.
 # ---------------------------------------------------------------------------
@@ -183,11 +189,6 @@ except InstrumentConfigError as _exc:
 MULTIMETER_ADDRESS        = _CFG['multimeter']['address']
 MM_POLL_INTERVAL_S        = _CFG['multimeter']['poll_interval_s']
 MM_MEASUREMENT_INTERVAL_S = _CFG['multimeter']['measurement_interval_s']
-
-# DDE protocol identifiers, not settings — these name the OMNIC DDE service
-# itself and are fixed by the protocol, so they stay in the source.
-OMNIC_SERVER_NAME = 'OMNIC'
-OMNIC_TOPIC_NAME  = 'SPECTRA'
 
 OMNIC_PARAM_DIR             = _CFG['omnic']['param_dir']
 OMNIC_EXE                   = _CFG['omnic']['exe']
@@ -218,31 +219,11 @@ _MODE_EXP_KEYWORDS: dict[str, list[str]] = {
 DEFAULT_EXP_FILENAME = _MODE_EXP_DEFAULTS['Emission']
 
 # ---------------------------------------------------------------------------
-# Channel metadata
+# Multimeter panel layout
 #
-# The physical wiring of the Keithley multiplexer card.  Deliberately not
-# configurable: these channel numbers are the measurement-info CSV schema and
-# the science pipeline binds roles to specific numbers.  Labels live in
-# utils.CHANNEL_LABELS, shared with EmissionLWIR so the two cannot drift.
+# Display concerns only, so they stay here rather than moving to
+# automation/multimeter.py with the channel map they are derived from.
 # ---------------------------------------------------------------------------
-
-# Channels 101–102 use 4-wire resistance; 103–107 use temperature.
-_CHANNEL_MODES: dict[int, str] = {
-    101: 'FRES',
-    102: 'FRES',
-    103: 'Temperature',
-    104: 'Temperature',
-    105: 'Temperature',
-    106: 'Temperature',
-    107: 'Temperature',
-}
-
-# Display unit follows from the measurement function, so it is derived rather
-# than declared: a parallel dict could silently disagree with the instrument.
-_MODE_UNITS: dict[str, str] = {'FRES': 'Ω', 'Temperature': '°C'}
-_CHANNEL_UNITS: dict[int, str] = {
-    ch: _MODE_UNITS[mode] for ch, mode in _CHANNEL_MODES.items()
-}
 
 # Display order: ascending channels.
 _PANEL_ORDER: list[int] = sorted(_CHANNEL_MODES)
@@ -666,355 +647,6 @@ class InstrumentConfigDialog(tk.Toplevel):
 
 
 # ---------------------------------------------------------------------------
-# MultimeterController
-# ---------------------------------------------------------------------------
-
-class MultimeterController:
-    """
-    Manages the PyVISA connection and channel reads for the Keithley 2700.
-
-    Thread safety
-    -------------
-    ``read_channel`` acquires ``_lock`` around each VISA query to prevent
-    interleaving of writes from the live-poll thread and collection threads.
-
-    Parameters
-    ----------
-    address : str
-        VISA resource string (e.g. ``'TCPIP::192.0.2.10::1394::SOCKET'``).
-        The live value comes from ``instrument_config.yaml``.
-    """
-
-    # Trailing chars to strip from the SCPI response token.
-    # Empirical from ftir-automation-v4.py: FRES strips 5, Temperature strips 2.
-    _STRIP: dict[str, int] = {'FRES': 5, 'Temperature': 2}
-
-    def __init__(self, address: str) -> None:
-        self._address: str                     = address
-        self._resource: pyvisa.Resource | None = None
-        self._lock: threading.Lock             = threading.Lock()
-
-    @property
-    def connected(self) -> bool:
-        """True if a VISA resource is currently open."""
-        return self._resource is not None
-
-    @property
-    def address(self) -> str:
-        """Current VISA resource string."""
-        return self._address
-
-    @address.setter
-    def address(self, value: str) -> None:
-        """
-        Re-point the controller at a different instrument.
-
-        Does not reconnect: call ``connect`` afterwards, which closes any open
-        session first.  Used by the settings dialog so an address change takes
-        effect without restarting the GUI.
-        """
-        self._address = value
-
-    def connect(self) -> bool:
-        """
-        Open the VISA resource at the configured address.
-
-        Returns
-        -------
-        bool
-            True on success, False on any connection error.
-        """
-        self.disconnect()   # close any existing session before opening a new one
-        try:
-            rm  = pyvisa.ResourceManager()
-            res = rm.open_resource(self._address)
-            res.read_termination = '\n'
-            self._resource = res
-            logging.info("Multimeter connected: %s", self._address)
-            return True
-        except Exception as exc:
-            logging.error("Multimeter connect failed: %s", exc)
-            self._resource = None
-            return False
-
-    def disconnect(self) -> None:
-        """Close the VISA resource if open."""
-        if self._resource is not None:
-            try:
-                self._resource.close()
-            except Exception:
-                pass
-            self._resource = None
-
-    def read_channel(self, channel: int) -> float:
-        """
-        Read one Keithley channel.
-
-        Closes the relay for *channel*, sets the appropriate measurement
-        function, and queries a fresh reading via ``:SENSe:DATA:FRESh?``.
-
-        Parameters
-        ----------
-        channel : int
-            Channel number (101–107).
-
-        Returns
-        -------
-        float
-            Measured value in Ω for channels 101–102, °C for 103–107.
-
-        Raises
-        ------
-        RuntimeError
-            If the multimeter is not connected.
-        KeyError
-            If *channel* is not in the channel map.
-        pyvisa.errors.VisaIOError
-            On instrument communication failure.
-        """
-        if self._resource is None:
-            raise RuntimeError("Multimeter not connected")
-        mode  = _CHANNEL_MODES[channel]
-        strip = self._STRIP[mode]
-        with self._lock:
-            try:
-                self._resource.write(f':ROUTe:CLOSe (@{channel})')
-                self._resource.write(f":SENSe:FUNCtion '{mode}'")
-                raw = self._resource.query(':SENSe:DATA:FRESh?')
-            except pyvisa.errors.VisaIOError as exc:
-                # TCP connection lost; tear down so the next connect() starts clean.
-                self.disconnect()
-                raise
-        return float(raw.split(',')[0][:-strip])
-
-    def read_all_channels(self, channels: list[int]) -> dict[int, float]:
-        """
-        Read multiple channels sequentially.
-
-        Individual channel failures are logged and stored as ``float('nan')``
-        so a partial result is always returned rather than raising.
-
-        Parameters
-        ----------
-        channels : list of int
-            Channel numbers to read.
-
-        Returns
-        -------
-        dict[int, float]
-            Channel number → measured value; failed channels contain NaN.
-        """
-        readings: dict[int, float] = {}
-        for ch in channels:
-            try:
-                readings[ch] = self.read_channel(ch)
-            except Exception as exc:
-                logging.error("Channel %d read failed: %s", ch, exc)
-                readings[ch] = float('nan')
-        return readings
-
-
-# ---------------------------------------------------------------------------
-# SpectrometerController
-# ---------------------------------------------------------------------------
-
-class SpectrometerController:
-    """
-    Manages DDE communication with the OMNIC spectrometer application.
-
-    OMNIC must be open and fully loaded before ``connect`` is called.
-    All DDE commands execute synchronously; ``collect`` blocks its calling
-    thread until the scan reaches 100 %.
-
-    Parameters
-    ----------
-    server_name : str
-        DDE server name (``'OMNIC'``).
-    topic_name : str
-        DDE topic (``'SPECTRA'``).
-    """
-
-    def __init__(self, server_name: str, topic_name: str) -> None:
-        self._server_name: str = server_name
-        self._topic_name: str  = topic_name
-        self._server           = None
-        self._conv             = None
-
-    @property
-    def connected(self) -> bool:
-        """True if a DDE conversation is open."""
-        return self._conv is not None
-
-    def connect(self) -> bool:
-        """
-        Create a DDE server and open a conversation with OMNIC.
-
-        Returns
-        -------
-        bool
-            True on success.
-        """
-        srv = None
-        try:
-            srv  = dde.CreateServer()
-            srv.Create(self._server_name)
-            conv = dde.CreateConversation(srv)
-            conv.ConnectTo(self._server_name, self._topic_name)
-            self._server = srv
-            self._conv   = conv
-            logging.info("Spectrometer DDE connected: %s / %s",
-                         self._server_name, self._topic_name)
-            return True
-        except Exception as exc:
-            logging.error("Spectrometer connect failed: %s", exc)
-            # Destroy the server if it was created but ConnectTo failed;
-            # leaving it alive prevents a clean retry.
-            if srv is not None:
-                try:
-                    srv.Destroy()
-                except Exception:
-                    pass
-            self._server = None
-            self._conv   = None
-            return False
-
-    def disconnect(self) -> None:
-        """Drop DDE references without closing OMNIC."""
-        self._conv = None
-        if self._server is not None:
-            try:
-                self._server.Destroy()
-            except Exception:
-                pass
-            self._server = None
-
-    def _exec(self, cmd: str) -> None:
-        """Send a DDE execute command; raises RuntimeError if not connected."""
-        if self._conv is None:
-            raise RuntimeError("Spectrometer not connected")
-        self._conv.Exec(cmd)
-
-    def set_option(self, name: str, value: str) -> None:
-        """Set an OMNIC Options parameter via DDE.
-
-        Uses the DDE ``Set`` command syntax::
-
-            [Set Options <name> <value>]
-
-        Parameters
-        ----------
-        name : str
-            Option parameter name (e.g. ``'CollectPrompt'``).
-        value : str
-            New value (e.g. ``'True'`` or ``'False'``).
-        """
-        self._exec(f'[Set Options {name} {value}]')
-
-    def load_experiment(self, exp_path: str) -> None:
-        """
-        Load an OMNIC experiment parameter file.
-
-        Parameters
-        ----------
-        exp_path : str
-            Full path to the ``.exp`` parameter file.
-        """
-        self._exec(f'[LoadParameters "{exp_path}"]')
-
-    def bench_align(self) -> None:
-        """Trigger the OMNIC bench alignment routine."""
-        self._exec('[Invoke StartBenchAlign]')
-
-    def start_collect(self, name: str) -> None:
-        """
-        Send the CollectSample DDE execute command.
-
-        Uses ``Auto Polling`` for all modes: no OMNIC prompts, no collection
-        window; spectrum is placed directly in the active spectral window.
-        Shutters are left in manual/always-open mode in the ``.exp`` file.
-        T/R purge equilibration is handled by the GUI before this call.
-
-        Must be called from the main thread (Win32 DDE requires a message pump).
-        Returns immediately; use :meth:`poll_collect_status` to track progress.
-
-        Parameters
-        ----------
-        name : str
-            Spectrum label passed to OMNIC.
-        """
-        self._exec(f'[CollectSample "{name}" Auto Polling]')
-
-    def poll_collect_status(self) -> tuple[int, int]:
-        """
-        Request the current collection progress from OMNIC.
-
-        Must be called from the main thread (Win32 DDE requires a message pump).
-
-        Returns
-        -------
-        tuple[int, int]
-            ``(n_scans_completed, pct_complete)`` where *pct_complete* is 0–100.
-        """
-        if self._conv is None:
-            raise RuntimeError("Spectrometer not connected")
-        status = self._conv.Request('Collect Status')
-        parts  = status.split(',')
-        return int(parts[0]), int(parts[7])
-
-    def export_csv(self, out_path: str) -> None:
-        """
-        Export the currently displayed spectrum to a CSV file.
-
-        Parameters
-        ----------
-        out_path : str
-            Destination file path (OMNIC requires the ``.CSV`` extension).
-        """
-        self._exec(f'[Export "{out_path}"]')
-
-    def display(self) -> None:
-        """Display the most recently collected spectrum in OMNIC."""
-        self._exec('[Display]')
-
-    def hide_selected(self) -> None:
-        """Hide the selected spectrum in the OMNIC spectral window."""
-        self._exec('[HideSelectedSpectra]')
-
-    def query_exp_params(self) -> dict:
-        """
-        Query current experiment parameters from OMNIC via DDE Request.
-
-        Must be called from the main thread.  Failures on individual
-        parameters are silently stored as empty strings.
-
-        Returns
-        -------
-        dict
-            Mapping of parameter key → string value.
-        """
-        if self._conv is None:
-            return {}
-        requests = [
-            ('resolution',   'Collect Resolution'),
-            ('num_scans',    'Collect NumScans'),
-            ('apodization',  'Collect ApodizationFunction'),
-            ('zero_fill',    'Collect ZeroFill'),
-            ('high_cutoff',  'Bench HighCutoff'),
-            ('low_cutoff',   'Bench LowCutoff'),
-            ('gain',         'Bench Gain'),
-            ('beamsplitter', 'Bench BeamSplitter'),
-            ('velocity',     'Bench Velocity'),
-        ]
-        params: dict = {}
-        for key, dde_param in requests:
-            try:
-                params[key] = self._conv.Request(dde_param).strip()
-            except Exception:
-                params[key] = ''
-        return params
-
-
-# ---------------------------------------------------------------------------
 # Helper
 # ---------------------------------------------------------------------------
 
@@ -1427,7 +1059,7 @@ class AutomateFTIR(tk.Tk):
     _channel_vars : dict[int, tk.StringVar]
         Live-updated display values for each multimeter channel.
     _mm : MultimeterController
-        Keithley 2700 connection manager.
+        Keithley 2701 connection manager.
     _spec : SpectrometerController
         OMNIC DDE connection manager.
     _spectra_data : dict[str, dict]
@@ -1506,6 +1138,15 @@ class AutomateFTIR(tk.Tk):
         # ── Multimeter display ────────────────────────────────────────────
         self._mm_mode_var    = tk.StringVar(value='live')
         self._live_readings: dict[int, float] = {}   # last live-poll snapshot
+        # Wall-clock time the snapshot above was taken, so the "Last updated"
+        # label can be restored with it rather than left showing a stale time.
+        self._live_readings_time: datetime | None = None
+        # Monotonic time of the last successful all-channel sweep from ANY path
+        # (live poll, Refresh, collection sample).  Read by the poll thread to
+        # keep automatic sweeps at least MM_POLL_INTERVAL_S apart across thread
+        # restarts.  A plain float, not a Tk variable, because it is read from
+        # a worker thread -- same reasoning as _last_mode.
+        self._mm_last_sweep_mono: float | None = None
         self._channel_vars: dict[int, tk.StringVar] = {
             ch: tk.StringVar(value='—') for ch in _PANEL_ORDER
         }
@@ -2237,7 +1878,19 @@ class AutomateFTIR(tk.Tk):
             This thread's own stop flag, assigned by :meth:`_start_live_poll`.
             Not read from ``self`` — the attribute is rebound on every restart.
         """
-        while not stop.wait(MM_POLL_INTERVAL_S):
+        # The first sweep waits only for what remains of the interval since the
+        # last successful sweep.  The thread is restarted from five places
+        # (connect, Live/Sample radio, experiment mode, session load, collection
+        # abort), so waiting a full interval on every start left the display
+        # blank for up to five minutes after connecting, while reading
+        # immediately on every start would cycle the relays on each radio
+        # click.  This way the first connect reads at once and automatic
+        # sweeps are never closer together than MM_POLL_INTERVAL_S.
+        last = self._mm_last_sweep_mono
+        wait_s = (0.0 if last is None
+                  else max(0.0, MM_POLL_INTERVAL_S - (time.monotonic() - last)))
+        while not stop.wait(wait_s):
+            wait_s = MM_POLL_INTERVAL_S
             if not self._mm.connected or self._last_mode != 'Emission':
                 break
             readings = self._mm.read_all_channels(list(_PANEL_ORDER))
@@ -2260,7 +1913,10 @@ class AutomateFTIR(tk.Tk):
         self.update_all_channels(readings)
         self._append_live_log(readings)
         if any(not np.isnan(v) for v in readings.values()):
-            self._mm_last_updated_var.set(datetime.now().strftime('%H:%M:%S'))
+            now = datetime.now()
+            self._live_readings_time = now
+            self._mm_last_sweep_mono = time.monotonic()
+            self._mm_last_updated_var.set(now.strftime('%H:%M:%S'))
 
     def _append_live_log(
         self,
@@ -2299,10 +1955,14 @@ class AutomateFTIR(tk.Tk):
         if self._mm_mode_var.get() == 'live':
             if self._mm.connected:
                 self._start_live_poll()
-            # Restore the last live snapshot, or blank if none yet.
+            # Restore the last live snapshot, or blank if none yet, together
+            # with the time it was taken -- otherwise the label keeps whatever
+            # time was last written, which may belong to a different reading.
             for ch in _PANEL_ORDER:
                 v = self._live_readings.get(ch)
                 self._channel_vars[ch].set('—' if v is None else f'{v:.2f}')
+            t = self._live_readings_time
+            self._mm_last_updated_var.set('—' if t is None else t.strftime('%H:%M:%S'))
         else:
             self._stop_live_poll()
             self._display_selected_spectrum_channels()
@@ -3374,10 +3034,23 @@ class AutomateFTIR(tk.Tk):
                        messagebox.showerror('Multimeter error', msg))
 
     def _on_refresh_result(self, readings: dict[int, float]) -> None:
-        """Main thread: store live snapshot; only push to display in Live mode."""
+        """
+        Main thread: store live snapshot; only push to display in Live mode.
+
+        The snapshot's timestamp is stored even in Sample mode, so that
+        switching back to Live restores the values *and* the time they were
+        taken (see :meth:`_on_mm_mode_change`).
+        """
         self._live_readings = readings
+        now = datetime.now()
+        fresh = any(not np.isnan(v) for v in readings.values())
+        if fresh:
+            self._live_readings_time = now
+            self._mm_last_sweep_mono = time.monotonic()
         if self._mm_mode_var.get() == 'live':
             self.update_all_channels(readings)
+            if fresh:
+                self._mm_last_updated_var.set(now.strftime('%H:%M:%S'))
 
     # -----------------------------------------------------------------------
     # Spectra list
@@ -4083,6 +3756,9 @@ class AutomateFTIR(tk.Tk):
                 self._mm_measurement_samples[ch].append(val)
         self.update_all_channels(readings)
         if any(not np.isnan(v) for v in readings.values()):
+            # A collection sample is a real relay sweep, so it defers the next
+            # automatic poll just like a live or Refresh reading does.
+            self._mm_last_sweep_mono = time.monotonic()
             self._mm_last_updated_var.set(now.strftime('%H:%M:%S'))
 
     def _compute_mm_stats(self) -> dict[int, dict]:

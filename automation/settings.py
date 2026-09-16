@@ -1,6 +1,11 @@
 """
 Instrument configuration loader for AutomateFTIR.
 
+Formerly ``speclab/instrument_config.py``; moved into ``automation/`` in the
+v0.11.x refactor so the acquisition/analysis boundary is a directory rather
+than a docstring convention.  The YAML files did not move and still live at
+the package root.
+
 Site-specific and operational settings live in ``instrument_config.yaml`` at
 the package root.  That file is untracked; ``instrument_config.example.yaml``
 is tracked and is copied into place the first time the GUI runs on a machine.
@@ -38,7 +43,7 @@ and likewise stay in the source.
 
 Usage
 -----
->>> from speclab.instrument_config import load_instrument_config
+>>> from speclab.automation.settings import load_instrument_config
 >>> cfg, first_run = load_instrument_config()
 >>> cfg['multimeter']['address']
 'TCPIP::10.11.100.182::1394::SOCKET'
@@ -50,7 +55,11 @@ from pathlib import Path
 
 import yaml
 
-_ROOT         = Path(__file__).resolve().parent
+# The YAML lives at the PACKAGE root, one level above this module -- this
+# file moved into automation/ in the v0.11.x refactor while the config
+# files stayed put.  A single .parent here would silently resolve to
+# automation/ and copy the example config into the wrong directory.
+_ROOT         = Path(__file__).resolve().parent.parent
 _LIVE_PATH    = _ROOT / 'instrument_config.yaml'
 _EXAMPLE_PATH = _ROOT / 'instrument_config.example.yaml'
 

@@ -16,7 +16,7 @@ rad2wl / rad2wn         Spectral radiance unit conversions.
 r2t_lo / r2t_hi         PRT resistance → temperature (NAU PRTs 31985/31986).
 r2t_swri                PRT resistance → temperature (SwRI PRTs).
 r2t_nau                 PRT resistance → temperature (NAU standard, returns K).
-CHANNEL_LABELS          Keithley 2700 channel map (fixed wiring, not config).
+CHANNEL_LABELS          Keithley 2701 channel map (fixed wiring, not config).
 readEmissionTXTnotes    Parse legacy TXT emission measurement notes.
 readEmissionCSVnotes    Load CSV/XLS emission measurement notes.
 readOMNIC               Read a two-column OMNIC CSV spectrum file.
@@ -376,7 +376,7 @@ def rad2wn(
 # =============================================================================
 # ============================ Keithley channel map ===========================
 # =============================================================================
-# Physical wiring of the Keithley 2700 multiplexer card.  Deliberately *not*
+# Physical wiring of the Keithley 2701 multiplexer card.  Deliberately *not*
 # user-configurable: the channel numbers are a data contract.  They appear as
 # the ``channel_101``..``channel_107`` columns of every measurement-info CSV,
 # are read back by readEmissionCSVnotes below and by functions.py, plot.py and

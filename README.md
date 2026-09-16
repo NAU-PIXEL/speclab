@@ -47,7 +47,7 @@ Ports and extends algorithms from the DaVinci spectroscopy environment.
 | `speclib-viewer`        | `SpeclibViewer`       | all          | Browse and build spectral libraries (LWIR / VSWIR) |
 | `emission-processor`    | `EmissionLWIR`        | all          | Interactive emcal / SMA results viewer |
 | `reflectance-vswir`     | `ReflectanceVSWIR`    | all          | VSWIR reflectance viewer and band analysis |
-| `AutomateFTIR.pyw`      | —                     | Windows only | Automated FTIR data collection (OMNIC DDE + Keithley 2700) |
+| `AutomateFTIR.pyw`      | —                     | Windows only | Automated FTIR data collection (OMNIC DDE + Keithley 2701) |
 
 ## Installation
 
