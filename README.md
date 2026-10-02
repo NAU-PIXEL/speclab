@@ -200,6 +200,16 @@ Each subfolder contains sample CSVs, `bbhot.CSV`, `bbwarm.CSV`, and a
 | `ASD_data/Orochi_analyses_2.csv` | ASD field reflectance spectra (Orochi site) |
 | `dummy_vswir/` | Synthetic VSWIR dataset for testing |
 
+## Running the tests
+
+```bash
+pip install -e ".[test]"
+pytest
+```
+
+Tests live in `tests/`. The `emcal` integration test uses
+`example_data/WardRocks_igneous1` and is skipped if that folder is missing.
+
 ## Bundled spectral libraries
 
 | File | Spectral range | Contents |
