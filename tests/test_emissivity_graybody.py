@@ -182,9 +182,9 @@ class TestEmcal:
         with pytest.raises(ValueError, match="unknown method 'mmd'"):
             speclab.emcal("/nonexistent", method="mmd")
 
-    def test_temp_spread_rejected_for_other_methods(self):
-        with pytest.raises(ValueError, match="only supported for method='graybody'"):
-            speclab.emcal("/nonexistent", method="nem", temp_spread=5.0)
+    def test_temp_spread_rejected_for_hullfit(self):
+        with pytest.raises(ValueError, match="not supported for method='hullfit'"):
+            speclab.emcal("/nonexistent", method="hullfit", temp_spread=5.0)
 
     @pytest.mark.skipif(not os.path.isdir(EXAMPLE_DIR), reason="example data not available")
     def test_graybody_runs_on_example_data(self):

@@ -1542,10 +1542,12 @@ def emcal(
         ``method='hullfit'``.  The range is centred on the peak brightness
         temperature within the fitting window.  Default 50 K.
     temp_spread : float or tuple[float, float]
-        Linear sample-temperature drift during acquisition (K, total range)
-        for ``method='graybody'``: a float fixes it, a ``(min, max)`` tuple
-        fits it within bounds.  Default 0 (isothermal).  Other methods
-        raise ``ValueError`` if a non-zero drift is requested.
+        Linear sample-temperature drift during acquisition (K, total range).
+        ``'nem'``, ``'alpha'`` and ``'graybody'`` accept a single value (the
+        Planck function is averaged over the drift); ``'graybody'`` also
+        accepts a ``(min, max)`` tuple and fits the drift within bounds.
+        ``'hullfit'`` / ``'hullfit_linear'`` raise ``ValueError`` for any
+        non-zero drift.  Default 0 (isothermal).
     violation_weight : float
         Weight applied to channels where ``data > model`` in the hullfit
         violation-repair loop.  Default 5.0.
@@ -1599,8 +1601,17 @@ def emcal(
 
     if method not in methods:
         raise ValueError(f"emcal: unknown method {method!r}; choose from {sorted(methods)}")
-    if method != "graybody" and (isinstance(temp_spread, (tuple, list)) or temp_spread != 0.0):
-        raise ValueError(f"emcal: temp_spread is only supported for method='graybody' (got method={method!r})")
+    _spread_bounded = isinstance(temp_spread, (tuple, list))
+    if method in ("hullfit", "hullfit_linear") and (_spread_bounded or temp_spread != 0.0):
+        raise ValueError(
+            f"emcal: temp_spread is not supported for method={method!r}; its Planck mixture "
+            "already models a temperature distribution (see temp_halfwidth)"
+        )
+    if method in ("nem", "alpha") and _spread_bounded:
+        raise ValueError(
+            f"emcal: a bounded temp_spread {temp_spread!r} needs a fit; use method='graybody', "
+            f"or a single drift value for method={method!r}"
+        )
 
     if method == "hullfit":
         if _is_lab:
@@ -1671,11 +1682,11 @@ def emcal(
                 em = emissivity_nem(wn, data[i, :], inst=lab,
                                     max_emiss=max_emiss, wn_range=wn_range,
                                     wn_range_cold=(400, 900),
-                                    downwelling_t=env_t)
+                                    downwelling_t=env_t, temp_spread=temp_spread)
             else:
                 em = emissivity_nem(wn, data[i, :], inst=lab,
                                     max_emiss=max_emiss, wn_range=wn_range,
-                                    downwelling_t=env_t)
+                                    downwelling_t=env_t, temp_spread=temp_spread)
             out["emiss_full"][labels[i]] = em
             out["emiss"][labels[i]] = em["emiss"]
             out["rad0"][labels[i]] = em["rad_bb"]
@@ -1683,7 +1694,7 @@ def emcal(
             env_t = _env_temp_k(labels[i])
             em = emissivity_alpha(
                 wn, data[i, :], max_emiss=max_emiss, wn_range=wn_range,
-                downwelling_t=env_t,
+                downwelling_t=env_t, temp_spread=temp_spread,
             )
             out["emiss_full"][labels[i]] = em
             out["emiss"][labels[i]] = em["emiss"]
@@ -3362,6 +3373,7 @@ def emissivity_nem(
     downwelling_t: float = 0.0,
     downwelling_e: float = 1.0,
     downwelling_rad: np.ndarray | None = None,
+    temp_spread: float = 0.0,
 ) -> dict:
     """
     Retrieve emissivity via the Normalized Emissivity Method (NEM) with
@@ -3431,11 +3443,18 @@ def emissivity_nem(
     downwelling_rad : np.ndarray or None
         Pre-computed downwelling radiance spectrum.  When provided it takes
         precedence over ``downwelling_t`` / ``downwelling_e``.
+    temp_spread : float
+        Linear sample-temperature drift during the acquisition (K, total
+        range), modelled as the time-average of the Planck function over
+        ``temp ± temp_spread/2`` (see :func:`_planck_spread`).  Brightness
+        temperatures and the ideal blackbody radiance become drift-aware;
+        ``temp`` is then the mean temperature.  Default 0 (isothermal,
+        identical to the plain Planck path).
 
     Returns
     -------
     dict
-        Keys: ``wn``, ``data``, ``rad_bb``, ``emiss``, ``temp``,
+        Keys: ``wn``, ``data``, ``rad_bb``, ``emiss``, ``temp``, ``temp_spread``,
         ``wn_t1``, ``wn_t2``, ``max_t1``, ``max_t2``,
         ``tb``, ``tb_smooth1``, ``tb_smooth2``,
         ``inst``, ``wn_range``, ``wn_range_cold``, ``filter_size``,
@@ -3461,6 +3480,11 @@ def emissivity_nem(
 
     if inst is not None:
         logging.info("emissivity_nem: using '%s' instrument preset", inst)
+    if isinstance(temp_spread, (tuple, list)) or temp_spread < 0:
+        raise ValueError(
+            f"emissivity_nem: temp_spread must be a single non-negative value (K), got {temp_spread!r}; "
+            "bounded drifts are only supported by emissivity_graybody"
+        )
 
     # Ref: spectral_tools.dvrc::emissivity, lines 820–958
     if max_emiss_low is None:
@@ -3486,7 +3510,9 @@ def emissivity_nem(
         data_bt = data - (1.0 - max_emiss) * _dw_rad
     else:
         data_bt = data
-    tb = utils.bbt(wn, data_bt / max_emiss)
+    tb = _bbt_spread(wn, data_bt / max_emiss, temp_spread)
+    if temp_spread > 0.0:
+        tb = np.nan_to_num(tb, nan=0.0)   # no drift-aware solution → excluded from the peak search
 
     # --- Step 2a: warm-target brightness temperature (full wn range) ---
     t1 = tb.copy()
@@ -3504,7 +3530,9 @@ def emissivity_nem(
             data_bt_low = data - (1.0 - max_emiss_low) * _dw_rad
         else:
             data_bt_low = data
-        tb2 = utils.bbt(wn, data_bt_low / max_emiss_low)
+        tb2 = _bbt_spread(wn, data_bt_low / max_emiss_low, temp_spread)
+        if temp_spread > 0.0:
+            tb2 = np.nan_to_num(tb2, nan=0.0)
     else:
         tb2 = tb
     t2  = tb2.copy()
@@ -3535,7 +3563,9 @@ def emissivity_nem(
     )
 
     # --- Step 4: ideal blackbody radiance at target temperature ---
-    rad_bb = utils.rad(wn, temp)
+    rad_bb = _planck_spread(wn, temp, temp_spread)
+    if temp_spread > 0.0:
+        logging.info("emissivity_nem: drift-aware Planck, temp_spread = %.1f K", temp_spread)
 
     # --- Step 5: emissivity with optional downwelling correction ---
     # Ref: spectral_tools.dvrc::emissivity, lines 932–947
@@ -3570,6 +3600,7 @@ def emissivity_nem(
         'max_emiss_low':    max_emiss_low,
         'co2_range':        co2_range,
         'toffset':          toffset,
+        'temp_spread':      temp_spread,
         'threshold_t_cold': threshold_t_cold,
         'threshold_t_warm': threshold_t_warm,
         'downwelling_t':    downwelling_t,
@@ -3587,6 +3618,7 @@ def emissivity_alpha(
     downwelling_t: float = 0.0,
     downwelling_e: float = 1.0,
     downwelling_rad: np.ndarray | None = None,
+    temp_spread: float = 0.0,
 ) -> dict:
     """
     Retrieve emissivity via the Alpha Residuals method with optional
@@ -3649,16 +3681,28 @@ def emissivity_alpha(
     downwelling_rad : np.ndarray or None
         Pre-computed downwelling radiance spectrum.  Takes precedence
         over downwelling_t / downwelling_e when provided.
+    temp_spread : float
+        Linear sample-temperature drift during the acquisition (K, total
+        range), modelled as the time-average of the Planck function over
+        ``temp ± temp_spread/2`` (see :func:`_planck_spread`).  Brightness
+        temperatures and the ideal blackbody radiance become drift-aware;
+        ``t_ref`` and ``temp`` are then mean temperatures.  Default 0 (isothermal,
+        identical to the plain Planck path).
 
     Returns
     -------
     dict
         Keys: ``wn``, ``data``, ``data0_eff``, ``data_net``, ``emiss``,
-        ``temp``, ``t_ref``, ``rad_bb``, ``wn_range``, ``co2_range``,
+        ``temp``, ``t_ref``, ``temp_spread``, ``rad_bb``, ``wn_range``, ``co2_range``,
         ``max_emiss``, ``downwelling_t``, ``downwelling_e``,
         ``downwelling_rad``, ``elapsed``.
     """
     start = time.perf_counter()
+    if isinstance(temp_spread, (tuple, list)) or temp_spread < 0:
+        raise ValueError(
+            f"emissivity_alpha: temp_spread must be a single non-negative value (K), got {temp_spread!r}; "
+            "bounded drifts are only supported by emissivity_graybody"
+        )
 
     # --- Downwelling radiance ---
     if downwelling_rad is not None:
@@ -3684,16 +3728,17 @@ def emissivity_alpha(
     data_net_fit = data_net[fit_mask]
 
     # --- Step 2: reference temperature — mean BBT over fit window ---
-    bbt_init = utils.bbt(
+    bbt_init = _bbt_spread(
         wn_fit,
         np.where(data_net_fit > 0, data_net_fit / max_emiss, np.nan),
+        temp_spread,
     )
     t_ref = float(np.nanmean(bbt_init))
 
     logging.info("emissivity_alpha: T_ref = %.1f K (mean BBT over fit window)", t_ref)
 
     # --- Step 3: provisional emissivity, rescaled so fit-window max = max_emiss ---
-    planck_ref = utils.rad(wn, t_ref)
+    planck_ref = _planck_spread(wn, t_ref, temp_spread)
     emiss_prov = np.where(data_net > 0, data_net / planck_ref, np.nan)
     emiss_max  = float(np.nanmax(emiss_prov[fit_mask]))
     emiss      = max_emiss * emiss_prov / emiss_max
@@ -3707,12 +3752,12 @@ def emissivity_alpha(
     surf_em        = np.full(int(fit_mask.sum()), np.nan)
     surf_em[valid] = (d_fit[valid] - (1.0 - e_fit[valid]) * dw_fit[valid]) / e_fit[valid]
     surf_em        = np.where(surf_em > 0, surf_em, np.nan)
-    bbt_final      = utils.bbt(wn_fit, surf_em)
+    bbt_final      = _bbt_spread(wn_fit, surf_em, temp_spread)
     temp           = float(np.nanmedian(bbt_final))
 
     logging.info("emissivity_alpha: temp = %.1f K (median BBT inversion)", temp)
 
-    rad_bb    = utils.rad(wn, t_ref)
+    rad_bb    = planck_ref
     data0_eff = (data - _dw_rad) / max_emiss
 
     stop = time.perf_counter()
@@ -3725,6 +3770,7 @@ def emissivity_alpha(
         'emiss':           emiss,
         'temp':            temp,
         't_ref':           t_ref,
+        'temp_spread':     temp_spread,
         'rad_bb':          rad_bb,
         'wn_range':        wn_range,
         'co2_range':       co2_range,
@@ -3738,7 +3784,7 @@ def emissivity_alpha(
 
 def _planck_spread(
     wn: np.ndarray,
-    temp: float,
+    temp: float | np.ndarray,
     temp_spread: float = 0.0,
     n_nodes: int = 16,
 ) -> np.ndarray:
@@ -3755,8 +3801,9 @@ def _planck_spread(
     ----------
     wn : np.ndarray
         Wavenumber axis (cm⁻¹), shape (n_bands,).
-    temp : float
-        Mean temperature (K).
+    temp : float or np.ndarray
+        Mean temperature (K): a scalar, or one value per channel with
+        shape (n_bands,).
     temp_spread : float
         Total temperature range of the drift (K).  0 returns the plain
         Planck function.
@@ -3772,8 +3819,90 @@ def _planck_spread(
     if temp_spread <= 0.0:
         return utils.rad(wn, temp)
     nodes, weights = np.polynomial.legendre.leggauss(n_nodes)
-    temps = temp + 0.5 * temp_spread * nodes
-    return 0.5 * np.sum(weights[:, None] * utils.rad(wn[None, :], temps[:, None]), axis=0)
+    temps = np.asarray(temp, dtype=float) + 0.5 * temp_spread * nodes[:, None]
+    return 0.5 * np.sum(weights[:, None] * utils.rad(wn[None, :], temps), axis=0)
+
+
+def _bbt_spread(
+    wn: np.ndarray,
+    radiance: np.ndarray,
+    temp_spread: float = 0.0,
+    n_nodes: int = 16,
+    max_iter: int = 20,
+    tol: float = 1e-6,
+) -> np.ndarray:
+    """
+    Drift-aware brightness temperature: inverse of :func:`_planck_spread`.
+
+    For each channel, finds the mean temperature T such that the Planck
+    function averaged over ``T ± temp_spread/2`` equals *radiance*.  Starts
+    from the plain brightness temperature and refines with Newton steps
+    (the drift-averaged Planck function is monotonic in T).
+
+    Parameters
+    ----------
+    wn : np.ndarray
+        Wavenumber axis (cm⁻¹), shape (n_bands,).
+    radiance : np.ndarray
+        Radiance, mW m⁻² sr⁻¹ (cm⁻¹)⁻¹, shape (n_bands,).
+    temp_spread : float
+        Total temperature range of the drift (K).  0 returns
+        :func:`utils.bbt` unchanged.
+    n_nodes : int
+        Quadrature nodes for the drift average.
+    max_iter : int
+        Maximum Newton iterations.
+    tol : float
+        Convergence tolerance on the temperature update (K).
+
+    Returns
+    -------
+    np.ndarray
+        Mean brightness temperature (K), shape (n_bands,).  NaN where no
+        drift-aware solution exists (non-positive or non-finite radiance,
+        or a ramp that would extend below 1 K).
+    """
+    if temp_spread <= 0.0:
+        return utils.bbt(wn, radiance)
+
+    c2 = 1.4387752    # K cm, as in utils.rad / utils.bbt
+    nodes, weights = np.polynomial.legendre.leggauss(n_nodes)
+    radiance = np.asarray(radiance, dtype=float)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        temp = utils.bbt(wn, radiance)
+    floor = 0.5 * temp_spread + 1.0
+    valid = np.isfinite(radiance) & (radiance > 0) & np.isfinite(temp)
+    # Below the drift-averaged radiance at the floor temperature there is no solution
+    with np.errstate(over="ignore"):   # exp overflow at very low T is a harmless zero radiance
+        valid[valid] &= radiance[valid] > _planck_spread(wn[valid], floor, temp_spread, n_nodes)
+    temp = np.where(valid, np.maximum(temp, floor), np.nan)
+    if not valid.any():
+        return temp
+    w = wn[valid]
+    target = radiance[valid]
+    t = temp[valid]
+
+    converged = False
+    for _ in range(max_iter):
+        temps = t[None, :] + 0.5 * temp_spread * nodes[:, None]          # (n_nodes, n_valid)
+        with np.errstate(over="ignore"):
+            b = utils.rad(w[None, :], temps)
+        x = c2 * w[None, :] / temps
+        db = b * (x / temps) / -np.expm1(-x)                            # dB/dT
+        f_val = 0.5 * np.sum(weights[:, None] * b, axis=0) - target
+        f_der = 0.5 * np.sum(weights[:, None] * db, axis=0)
+        step = f_val / f_der
+        t = np.maximum(t - step, floor)
+        if np.nanmax(np.abs(step)) < tol:
+            converged = True
+            break
+    if not converged:
+        logging.warning(
+            "_bbt_spread: Newton iteration did not converge in %d steps (max update %.2e K)",
+            max_iter, np.nanmax(np.abs(step)),
+        )
+    temp[valid] = t
+    return temp
 
 
 def emissivity_graybody(

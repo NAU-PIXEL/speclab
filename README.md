@@ -15,6 +15,7 @@ Ports and extends algorithms from the DaVinci spectroscopy environment.
 - Convex-hull Planck mixture (`hullfit` / `hullfit_linear`) — strict upper-bound enforcement
 - Alpha Residuals (`alpha`) — mean-BT reference with max-emissivity rescaling
 - Graybody (`graybody`) — joint fit of one constant emissivity and one temperature; for spectrally gray targets (coatings, blackbody surfaces), optional fixed or bounded temperature drift (`temp_spread`)
+- Sample-temperature drift: `emcal(..., temp_spread=ΔT)` averages the Planck function over a linear ramp of ΔT kelvin during acquisition, for `nem`, `alpha` and `graybody` (`graybody` also accepts `(min, max)` bounds and fits the drift)
 
 **FTIR transmission / reflectance calibration**
 - `tracal` — transmission calibration from an AutomateFTIR measurement folder; pairs each sample with its closest-in-time background and blank
