@@ -393,7 +393,7 @@ class EmcalOptionsDialog(tk.Toplevel):
 
         rows = [
             ('lab',              'Lab',                       'combo', ['nau', 'asu', 'swri', 'spectrometer']),
-            ('method',           'Method',                    'combo', ['nem', 'alpha', 'hullfit_linear', 'hullfit', 'mmd']),
+            ('method',           'Method',                    'combo', ['nem', 'alpha', 'hullfit_linear', 'hullfit']),
             ('max_emiss',        'Max emissivity',            'float', None),
             ('bb_emiss',         'BB emissivity',             'float', None),
             ('n_bb',             'N BB (hullfit)',            'int',   None),

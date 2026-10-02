@@ -1799,7 +1799,7 @@ def is_emcal_result(d: dict) -> bool:
     Return ``True`` if *d* looks like an emcal (emissivity calibration) result.
 
     Signature check on the keys emcal always emits, regardless of method
-    (nem/mmd/alpha/hullfit): a scalar ``method``, the label-keyed ``emiss``
+    (nem/alpha/hullfit/graybody): a scalar ``method``, the label-keyed ``emiss``
     sub-dict, and ``max_emiss``.  Method-specific keys (e.g.
     ``sample_t_wavenumber``) are deliberately excluded so the check stays
     method-agnostic.  Distinct from sma (``algorithm``) and cal_rad (no
