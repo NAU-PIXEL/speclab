@@ -46,7 +46,7 @@ Usage
 >>> from speclab.automation.settings import load_instrument_config
 >>> cfg, first_run = load_instrument_config()
 >>> cfg['multimeter']['address']
-'TCPIP::10.11.100.182::1394::SOCKET'
+'TCPIP::192.0.2.10::1394::SOCKET'
 """
 
 import logging
