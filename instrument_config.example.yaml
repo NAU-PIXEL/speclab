@@ -64,7 +64,7 @@ omnic:
   experiments:
     Emission:     {file: 'Emission_MIR - Heated Sample.exp', keywords: [emission]}
     Transmission: {file: 'Transmission MIR.exp',             keywords: [transmiss]}
-    Reflectance:  {file: 'DiffusIR_MIR.exp',                 keywords: [diffusir, reflect]}
+    Reflectance:  {file: 'DiffusIR_MIR.exp',                 keywords: [diffusir, reflect, upir]}
 
 blackbody:
   # Auto-selection thresholds for the Collect BB dialog, degrees C.

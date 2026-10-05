@@ -303,8 +303,8 @@ class EmcalOptionsDialog(tk.Toplevel):
 
         rows = [
             ('lab',              'Lab',                          'combo', ['nau', 'asu', 'swri', 'spectrometer']),
-            ('method',           'Method',                       'combo', ['nem', 'alpha', 'hullfit_linear', 'hullfit', 'mmd']),
-            ('max_emiss',        'Max emissivity',               'float', None),
+            ('method',           'Method',                       'combo', ['nem', 'alpha', 'hullfit_linear', 'hullfit', 'graybody']),
+            ('max_emiss',        'Max emissivity (not graybody)', 'float', None),
             ('bb_emiss',         'BB emissivity',                'float', None),
             ('n_bb',             'N BB (hullfit)',               'int',   None),
             ('temp_halfwidth',   'Temp half-width K (hullfit)',  'float', None),
@@ -312,6 +312,7 @@ class EmcalOptionsDialog(tk.Toplevel):
             ('violation_tol',    'Violation tol (hullfit)',      'float', None),
             ('escalation_factor','Escalation factor (hullfit)',  'float', None),
             ('max_escalations',  'Max escalations (hullfit)',    'int',   None),
+            ('temp_spread',      'Temp drift ΔT K (nem/alpha/graybody)', 'str', None),
             ('noise_free',       'Noise-free IRF',               'bool',  None),
             ('apply_dehyd',      'Apply dehyd',                  'bool',  None),
         ]
@@ -327,9 +328,16 @@ class EmcalOptionsDialog(tk.Toplevel):
                 ttk.Combobox(frm, textvariable=var, values=opts,
                              state='readonly', width=18).grid(row=row, column=1, sticky=tk.W)
             else:
+                if key == 'temp_spread' and isinstance(val, (tuple, list)):
+                    val = f'{val[0]:g}, {val[1]:g}'
                 var = tk.StringVar(value=str(val))
                 ttk.Entry(frm, textvariable=var, width=12).grid(row=row, column=1, sticky=tk.W)
             self._vars[key] = var
+
+        ttk.Label(frm, text="ΔT: one value fixes the drift; 'min, max' fits it (graybody only)",
+                  foreground='gray').grid(row=len(rows), column=0, columnspan=2,
+                                          sticky=tk.W, pady=(0, 3))
+        rows = rows + [None]   # the hint occupies one grid row
 
         wn_lo, wn_hi = d.get('wn_range', (500.0, 1700.0))
         ttk.Label(frm, text='Wn range (cm⁻¹):').grid(
@@ -349,11 +357,38 @@ class EmcalOptionsDialog(tk.Toplevel):
         ttk.Button(bf, text='Run',    command=self._ok).pack(side=tk.LEFT, padx=4)
         ttk.Button(bf, text='Cancel', command=self.destroy).pack(side=tk.LEFT, padx=4)
 
+    @staticmethod
+    def _parse_temp_spread(text: str, method: str) -> float | tuple[float, float]:
+        """Parse the drift field: '' or one value → float; 'min, max' → tuple."""
+        # Ref: EmissionLWIR.py::EmcalOptionsDialog._parse_temp_spread (keep in sync)
+        parts = [p for p in text.replace(';', ',').split(',') if p.strip()]
+        if not parts:
+            return 0.0
+        if len(parts) == 1:
+            spread: float | tuple[float, float] = float(parts[0])
+            if spread < 0:
+                raise ValueError('Temp drift ΔT must be ≥ 0 K.')
+        elif len(parts) == 2:
+            lo, hi = float(parts[0]), float(parts[1])
+            if lo < 0 or hi <= lo:
+                raise ValueError("Temp drift bounds must be 'min, max' with 0 ≤ min < max.")
+            if method != 'graybody':
+                raise ValueError("A drift range 'min, max' needs method 'graybody'; "
+                                 f"use a single value for '{method}'.")
+            spread = (lo, hi)
+        else:
+            raise ValueError("Temp drift ΔT: enter one value or 'min, max'.")
+        if method in ('hullfit', 'hullfit_linear') and spread != 0.0:
+            raise ValueError(f"Temp drift is not supported for '{method}' "
+                             '(use Temp half-width instead).')
+        return spread
+
     def _ok(self) -> None:
         try:
+            method = self._vars['method'].get()
             self.result = {
                 'lab':               self._vars['lab'].get(),
-                'method':            self._vars['method'].get(),
+                'method':            method,
                 'max_emiss':         float(self._vars['max_emiss'].get()),
                 'bb_emiss':          float(self._vars['bb_emiss'].get()),
                 'n_bb':              int(self._vars['n_bb'].get()),
@@ -366,6 +401,8 @@ class EmcalOptionsDialog(tk.Toplevel):
                 'apply_dehyd':       bool(self._vars['apply_dehyd'].get()),
                 'wn_range':          (float(self._vars['wn_lo'].get()),
                                       float(self._vars['wn_hi'].get())),
+                'temp_spread':       self._parse_temp_spread(
+                                         self._vars['temp_spread'].get(), method),
             }
             self.destroy()
         except ValueError as exc:
@@ -1127,6 +1164,7 @@ class AutomateFTIR(tk.Tk):
             escalation_factor=4.0, max_escalations=4,
             noise_free=True, apply_dehyd=False,
             wn_range=(500.0, 1700.0),
+            temp_spread=0.0,
         )
         self._purge_delay_var   = tk.IntVar(value=PURGE_DELAY_S)
         self._purge_enabled_var = tk.BooleanVar(value=True)
@@ -2425,6 +2463,7 @@ class AutomateFTIR(tk.Tk):
                 noise_free          = opts['noise_free'],
                 apply_dehyd         = opts['apply_dehyd'],
                 wn_range            = opts['wn_range'],
+                temp_spread         = opts.get('temp_spread', 0.0),
                 save                = True,
                 ow                  = True,
                 on_missing_bb_temps = _bb_provider,
