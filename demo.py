@@ -61,7 +61,7 @@ NOTES_PATH = None
 BB1 = None   # warm BB
 BB2 = None   # hot  BB
 
-# Emissivity retrieval method: 'nem', 'mmd', or 'hullfit'
+# Emissivity retrieval method: 'nem', 'alpha', 'hullfit', 'hullfit_linear', or 'graybody'
 METHOD = 'nem'
 N_BB = 2
 

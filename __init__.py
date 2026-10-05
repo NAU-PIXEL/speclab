@@ -1,7 +1,7 @@
 """
 speclab — spectroscopy processing library.
 
-Provides emissivity calibration (NEM, hullfit), spectral utility functions,
+Provides emissivity calibration (NEM, Alpha, graybody, hullfit), spectral utility functions,
 water-vapour correction, spectral mixture analysis, and plotting tools.
 """
 
@@ -16,7 +16,7 @@ from .functions import (
     emissivity_alpha,
     emissivity_hullfit,
     emissivity_hullfit_linear,
-    emissivity_mmd,
+    emissivity_graybody,
     dehyd,
     sma,
     summary_sma,
@@ -78,4 +78,4 @@ from .utils import (
 from . import plot
 from .config import configure, get_config
 
-__version__ = "0.11.1"
+__version__ = "0.14.0"

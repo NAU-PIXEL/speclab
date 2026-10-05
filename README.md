@@ -7,14 +7,15 @@ Ports and extends algorithms from the DaVinci spectroscopy environment.
 ## Features
 
 **Emission calibration**
-- `emcal` — full lab emission calibration pipeline (blackbody IRF, NEM / hullfit / alpha / MMD emissivity retrieval, optional noise-free IRF smoothing, water-vapour correction)
+- `emcal` — full lab emission calibration pipeline (blackbody IRF, NEM / hullfit / alpha / graybody emissivity retrieval, optional noise-free IRF smoothing, water-vapour correction)
 - `dehyd` — water-vapour correction applied during or after `emcal`
 
 **Emissivity retrieval methods**
 - Normalized Emissivity Method (`nem`) — iterative BT peak anchoring
 - Convex-hull Planck mixture (`hullfit` / `hullfit_linear`) — strict upper-bound enforcement
 - Alpha Residuals (`alpha`) — mean-BT reference with max-emissivity rescaling
-- Maximum–Minimum Difference (`mmd`) — simple contrast-based baseline
+- Graybody (`graybody`) — joint fit of one constant emissivity and one temperature; for spectrally gray targets (coatings, blackbody surfaces), optional fixed or bounded temperature drift (`temp_spread`)
+- Sample-temperature drift: `emcal(..., temp_spread=ΔT)` averages the Planck function over a linear ramp of ΔT kelvin during acquisition, for `nem`, `alpha` and `graybody` (`graybody` also accepts `(min, max)` bounds and fits the drift)
 
 **FTIR transmission / reflectance calibration**
 - `tracal` — transmission calibration from an AutomateFTIR measurement folder; pairs each sample with its closest-in-time background and blank
@@ -171,7 +172,7 @@ Key settings at the top of `demo.py`:
 | Variable | Default | Description |
 |---|---|---|
 | `USE_MULTI_FOLDER` | `False` | `True` runs emcal on all four `example_data/` subfolders and merges |
-| `METHOD` | `'nem'` | Emissivity retrieval method: `'nem'`, `'hullfit'`, or `'mmd'` |
+| `METHOD` | `'nem'` | Emissivity retrieval method: `'nem'`, `'alpha'`, `'hullfit'`, `'hullfit_linear'`, or `'graybody'` |
 | `ENDLIB_PATH` | `spectral_libraries/speclib_JFS_rock_forming_minerals.hdf` | Endmember library for SMA |
 | `USE_SPECLIBVIEWER` | `False` | `True` opens `SpeclibViewer` to build a custom library interactively |
 | `SHOW_PLOTS` | `True` | Display emcal and SMA result plots |
@@ -199,6 +200,16 @@ Each subfolder contains sample CSVs, `bbhot.CSV`, `bbwarm.CSV`, and a
 |---|---|
 | `ASD_data/Orochi_analyses_2.csv` | ASD field reflectance spectra (Orochi site) |
 | `dummy_vswir/` | Synthetic VSWIR dataset for testing |
+
+## Running the tests
+
+```bash
+pip install -e ".[test]"
+pytest
+```
+
+Tests live in `tests/`. The `emcal` integration test uses
+`example_data/WardRocks_igneous1` and is skipped if that folder is missing.
 
 ## Bundled spectral libraries
 

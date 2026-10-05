@@ -59,6 +59,7 @@ _EMCAL_DEFAULTS: dict = dict(
     escalation_factor=4.0, max_escalations=4,
     noise_free=True, apply_dehyd=False,
     wn_range=(500.0, 1700.0),
+    temp_spread=0.0,
 )
 
 _CALRAD_DEFAULTS: dict = dict(
@@ -393,8 +394,8 @@ class EmcalOptionsDialog(tk.Toplevel):
 
         rows = [
             ('lab',              'Lab',                       'combo', ['nau', 'asu', 'swri', 'spectrometer']),
-            ('method',           'Method',                    'combo', ['nem', 'alpha', 'hullfit_linear', 'hullfit', 'mmd']),
-            ('max_emiss',        'Max emissivity',            'float', None),
+            ('method',           'Method',                    'combo', ['nem', 'alpha', 'hullfit_linear', 'hullfit', 'graybody']),
+            ('max_emiss',        'Max emissivity (not graybody)', 'float', None),
             ('bb_emiss',         'BB emissivity',             'float', None),
             ('n_bb',             'N BB (hullfit)',            'int',   None),
             ('temp_halfwidth',   'Temp half-width K (hullfit)', 'float', None),
@@ -402,6 +403,7 @@ class EmcalOptionsDialog(tk.Toplevel):
             ('violation_tol',    'Violation tol (hullfit)',   'float', None),
             ('escalation_factor','Escalation factor (hullfit)','float', None),
             ('max_escalations',  'Max escalations (hullfit)', 'int',   None),
+            ('temp_spread',      'Temp drift ΔT K (nem/alpha/graybody)', 'str', None),
             ('noise_free',       'Noise-free IRF',            'bool',  None),
             ('apply_dehyd',      'Apply dehyd',               'bool',  None),
         ]
@@ -417,9 +419,16 @@ class EmcalOptionsDialog(tk.Toplevel):
                 ttk.Combobox(frm, textvariable=var, values=opts,
                              state='readonly', width=18).grid(row=row, column=1, sticky=tk.W)
             else:
+                if key == 'temp_spread' and isinstance(val, (tuple, list)):
+                    val = f'{val[0]:g}, {val[1]:g}'
                 var = tk.StringVar(value=str(val))
                 ttk.Entry(frm, textvariable=var, width=12).grid(row=row, column=1, sticky=tk.W)
             self._vars[key] = var
+
+        ttk.Label(frm, text="ΔT: one value fixes the drift; 'min, max' fits it (graybody only)",
+                  foreground='gray').grid(row=len(rows), column=0, columnspan=2,
+                                          sticky=tk.W, pady=(0, 3))
+        rows = rows + [None]   # the hint occupies one grid row
 
         wn_lo, wn_hi = d.get('wn_range', (500.0, 1700.0))
         ttk.Label(frm, text='Wn range (cm⁻¹):').grid(
@@ -439,11 +448,37 @@ class EmcalOptionsDialog(tk.Toplevel):
         ttk.Button(bf, text='Run',    command=self._ok).pack(side=tk.LEFT, padx=4)
         ttk.Button(bf, text='Cancel', command=self.destroy).pack(side=tk.LEFT, padx=4)
 
+    @staticmethod
+    def _parse_temp_spread(text: str, method: str) -> float | tuple[float, float]:
+        """Parse the drift field: '' or one value → float; 'min, max' → tuple."""
+        parts = [p for p in text.replace(';', ',').split(',') if p.strip()]
+        if not parts:
+            return 0.0
+        if len(parts) == 1:
+            spread: float | tuple[float, float] = float(parts[0])
+            if spread < 0:
+                raise ValueError('Temp drift ΔT must be ≥ 0 K.')
+        elif len(parts) == 2:
+            lo, hi = float(parts[0]), float(parts[1])
+            if lo < 0 or hi <= lo:
+                raise ValueError("Temp drift bounds must be 'min, max' with 0 ≤ min < max.")
+            if method != 'graybody':
+                raise ValueError("A drift range 'min, max' needs method 'graybody'; "
+                                 f"use a single value for '{method}'.")
+            spread = (lo, hi)
+        else:
+            raise ValueError("Temp drift ΔT: enter one value or 'min, max'.")
+        if method in ('hullfit', 'hullfit_linear') and spread != 0.0:
+            raise ValueError(f"Temp drift is not supported for '{method}' "
+                             '(use Temp half-width instead).')
+        return spread
+
     def _ok(self) -> None:
         try:
+            method = self._vars['method'].get()
             self.result = {
                 'lab':               self._vars['lab'].get(),
-                'method':            self._vars['method'].get(),
+                'method':            method,
                 'max_emiss':         float(self._vars['max_emiss'].get()),
                 'bb_emiss':          float(self._vars['bb_emiss'].get()),
                 'n_bb':              int(self._vars['n_bb'].get()),
@@ -456,6 +491,8 @@ class EmcalOptionsDialog(tk.Toplevel):
                 'apply_dehyd':       bool(self._vars['apply_dehyd'].get()),
                 'wn_range':          (float(self._vars['wn_lo'].get()),
                                       float(self._vars['wn_hi'].get())),
+                'temp_spread':       self._parse_temp_spread(
+                                         self._vars['temp_spread'].get(), method),
             }
             self.destroy()
         except ValueError as exc:
@@ -2924,6 +2961,7 @@ class EmissionLWIR(tk.Tk):
                 noise_free          = opts['noise_free'],
                 apply_dehyd         = opts['apply_dehyd'],
                 wn_range            = opts['wn_range'],
+                temp_spread         = opts.get('temp_spread', 0.0),
                 downwelling_temps   = downwelling_temps,
                 on_missing_bb_temps = _bb_provider,
             )
@@ -2976,6 +3014,7 @@ class EmissionLWIR(tk.Tk):
                         noise_free          = opts['noise_free'],
                         apply_dehyd         = opts['apply_dehyd'],
                         wn_range            = opts['wn_range'],
+                        temp_spread         = opts.get('temp_spread', 0.0),
                         downwelling_temps   = _dw_map.get(fdir),
                         on_missing_bb_temps = bb_provider,
                     )
@@ -3492,15 +3531,21 @@ class EmissionLWIR(tk.Tk):
         colors         = [p['color'] for p in plt.rcParams['axes.prop_cycle']]
 
         def _model_overlay(lbl: str):
-            """Return rad0 adjusted to match the active radiance display space."""
+            """Return the model radiance adjusted to match the active display space."""
+            em_full = r.get('emiss_full', {}).get(lbl, {})
+            dw = em_full.get('downwelling_rad')
+            if em_full.get('rad_model') is not None and em_full.get('eps_gray') is not None:
+                # graybody: the fitted forward model eps*B + (1 - eps)*dw
+                model = np.asarray(em_full['rad_model'], dtype=float)
+                if self._rad_display_var.get() == 'corrected' and dw is not None:
+                    model = model - (1.0 - float(em_full['eps_gray'])) * np.asarray(dw, dtype=float)
+                return model
             rad0 = r.get('rad0', {}).get(lbl)
             if rad0 is None:
                 return None
-            if self._rad_display_var.get() == 'corrected':
-                dw = r.get('emiss_full', {}).get(lbl, {}).get('downwelling_rad')
-                if dw is not None:
-                    max_emiss = r.get('max_emiss', 0.98)
-                    rad0 = rad0 - (1.0 - max_emiss) * dw
+            if self._rad_display_var.get() == 'corrected' and dw is not None:
+                max_emiss = r.get('max_emiss', 0.98)
+                rad0 = rad0 - (1.0 - max_emiss) * dw
             return rad0
 
         if plot in ('stacked', 'selected'):
@@ -3743,7 +3788,8 @@ class EmissionLWIR(tk.Tk):
         if r is not None:
             em_rows.append(('Method',    r.get('method', '—')))
             max_e = r.get('max_emiss')
-            if max_e is not None:
+            is_graybody = 'eps_gray' in r.get('emiss_full', {}).get(lbl, {})
+            if max_e is not None and not is_graybody:   # graybody ignores max_emiss
                 em_rows.append(('max_emiss', f'{float(max_e):.3f}'))
             temp = r.get('sample_temps', {}).get(lbl)
             if temp is not None:
@@ -3784,6 +3830,42 @@ class EmissionLWIR(tk.Tk):
             wn_rc = em_full.get('wn_range_cold')
             if wn_rc is not None:
                 em_rows.append(('Wn range cold (cm⁻¹)', f'{int(wn_rc[0])}–{int(wn_rc[1])}'))
+
+            # Sample-temperature drift (nem / alpha / graybody)
+            spread = em_full.get('temp_spread')
+            sp_sig = em_full.get('temp_spread_sigma')
+            fitted = sp_sig is not None and np.isfinite(float(sp_sig))
+            if spread is not None and (fitted or float(spread) > 0):
+                if fitted and float(spread) < 0.05:
+                    txt = '0 (fitted: no drift preferred)'
+                elif fitted:
+                    txt = f'{float(spread):.1f} ± {float(sp_sig):.1f} (fitted)'
+                else:
+                    txt = f'{float(spread):.1f} (fixed)'
+                em_rows.append(('Temp drift ΔT (K)', txt))
+
+            # Graybody-specific
+            eps_g = em_full.get('eps_gray')
+            if eps_g is not None:
+                eps_s = em_full.get('eps_sigma')
+                em_rows.append(('Graybody ε', f'{float(eps_g):.4f}'
+                                + (f' ± {float(eps_s):.4f}' if eps_s is not None else '')))
+                t_s = em_full.get('temp_sigma')
+                if t_s is not None:
+                    em_rows.append(('T uncertainty (K)', f'± {float(t_s):.2f}'))
+                corr = em_full.get('eps_temp_corr')
+                if corr is not None:
+                    em_rows.append(('ε–T correlation', f'{float(corr):.3f}'))
+                rr = em_full.get('resid_rms')
+                if rr is not None:
+                    em_rows.append(('Residual rms (ε units)', f'{float(rr):.2e}'))
+                rs = em_full.get('resid_structure')
+                if rs is not None:
+                    flag = '  ⚠ not gray' if float(rs) > 1.0 else ''
+                    em_rows.append(('Residual structure', f'{float(rs):.2f}{flag}'))
+                wt = em_full.get('weighting')
+                if wt is not None:
+                    em_rows.append(('Weighting', str(wt)))
 
             # Hullfit-specific
             bb_temps = em_full.get('bb_temps')
